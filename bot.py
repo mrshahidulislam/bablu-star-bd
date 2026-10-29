@@ -79,7 +79,15 @@ async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                         c.execute("UPDATE users SET referrer=? WHERE id=?",(ref,u.id))
         except ValueError: pass
     ctx.user_data["mode"]="main"
-    await menu(update,ctx,"⭐ BABLU STAR BD-তে স্বাগতম!\nBuyer Mode অথবা Freelancer Mode বেছে নিন।")
+    await menu(
+        update,
+        ctx,
+        "🌟 BABLU STAR BD-তে আপনাকে স্বাগতম! 🌟\n\n"
+        "💼 আপনার কাজ, আপনার উপার্জন!\n"
+        "🛒 Buyer Mode — নিজের কাজ পোস্ট করুন\n"
+        "🧑‍💻 Freelancer Mode — কাজ করুন ও আয় করুন\n\n"
+        "👇 শুরু করতে নিচের একটি মোড বেছে নিন।"
+    )
 async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     u=update.effective_user; user_row(u); t=(update.effective_message.text or "").strip()
     with conn() as c:
@@ -124,7 +132,16 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("bKash/Nagad ডিপোজিট Txn ID দিয়ে জমা দিন। অ্যাডমিন যাচাইয়ের পর ব্যালেন্স যোগ হবে। উইথড্র/মোবাইল রিচার্জে ১৫% ফি।")
     elif t=="📜 নিয়মাবলি":
         await update.effective_message.reply_text("• কাজের দাম ক্যাটাগরি মিনিমামের কম নয় (কোনোটিই ৳২-এর নিচে নয়)।\n• ভুয়া অ্যাকাউন্ট, প্রতারণা, স্প্যাম বা প্ল্যাটফর্মের নিয়মভঙ্গকারী কাজ নিষিদ্ধ।\n• বাজেট আগে বায়ার ব্যালেন্স থেকে সংরক্ষিত হবে।\n• প্রুফ অ্যাডমিন অনুমোদন করলে ফ্রিল্যান্সার টাকা পাবেন।\n• ডিপোজিট/উইথড্র ম্যানুয়ালি যাচাই হয়।")
-    elif t=="🆘 সাহায্য": await update.effective_message.reply_text(f"সাহায্যের জন্য অ্যাডমিনের সঙ্গে যোগাযোগ করুন। আপনার Telegram ID: {u.id}")
+    elif t=="🆘 সাহায্য":
+        await update.effective_message.reply_text(
+            "📩 BABLU STAR BD — Support Center\n\n"
+            "আপনার কোনো সমস্যা বা প্রশ্ন থাকলে আমাদের ইমেইল করুন।\n\n"
+            "✉️ Support Email:\n"
+            "mrshahidulislam8989@gmail.com\n\n"
+            f"🆔 আপনার Telegram ID: {u.id}\n\n"
+            "সমস্যার বিস্তারিত লিখে ইমেইল পাঠান।\n"
+            "ধন্যবাদ — BABLU STAR BD"
+        )
     else: await update.effective_message.reply_text("মেনুর বাটন ব্যবহার করুন।")
 async def balance(update,uid,wallet):
     with conn() as c: r=c.execute(f"SELECT {wallet} FROM users WHERE id=?",(uid,)).fetchone()
