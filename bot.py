@@ -125,11 +125,22 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         with conn() as c: rs=c.execute("SELECT s.id,s.job_id,s.status,j.title FROM submissions s JOIN jobs j ON j.id=s.job_id WHERE s.worker_id=? ORDER BY s.id DESC LIMIT 20",(u.id,)).fetchall()
         await update.effective_message.reply_text("\n".join([f"#{r['id']} কাজ #{r['job_id']} {r['title']} — {r['status']}" for r in rs]) or "কোনো সাবমিশন নেই।")
     elif t=="💸 উইথড্র" and mode=="worker":
-        ctx.user_data["stage"]="wd_gross"; await update.effective_message.reply_text("কত টাকা তুলবেন? ১৫% ফি কাটা হবে। যেমন 100।")
+        ctx.user_data["stage"]="wd_gross"
+        await update.effective_message.reply_text(
+            "💸 উইথড্র রিকুয়েস্ট\n\nসর্বনিম্ন উইথড্র: ৳১০\nসার্ভিস ফি: ১৫%\n"
+            "উদাহরণ: ৳১০০ তুললে ফি ৳১৫, আপনি পাবেন ৳৮৫।\n\n"
+            "মোট উইথড্রের পরিমাণ লিখুন (শুধু টাকা, যেমন 100)। এরপর পেমেন্ট পদ্ধতি বাটন থেকে বেছে নিতে পারবেন।"
+        )
     elif t=="👥 রেফার লিংক" and mode=="worker":
         me=await ctx.bot.get_me(); await update.effective_message.reply_text(f"https://t.me/{me.username}?start=ref_{u.id}\nরেফার করা ব্যক্তির প্রথম অনুমোদিত উইথড্রয়ের মোট অঙ্কের ১০% একবার বোনাস।")
     elif t=="💳 পেমেন্ট তথ্য":
-        await update.effective_message.reply_text("bKash/Nagad ডিপোজিট Txn ID দিয়ে জমা দিন। অ্যাডমিন যাচাইয়ের পর ব্যালেন্স যোগ হবে। উইথড্র/মোবাইল রিচার্জে ১৫% ফি।")
+        await update.effective_message.reply_text(
+            "💳 BABLU STAR BD — পেমেন্ট তথ্য\n\n"
+            "➕ ডিপোজিট: বায়ার মোডে ডিপোজিট চাপুন, পরিমাণ লিখুন, বিকাশ/নগদ বেছে নিয়ে Transaction ID জমা দিন। অ্যাডমিন যাচাই করে ব্যালেন্স যোগ করবেন।\n\n"
+            "💸 উইথড্র: ফ্রিল্যান্সার মোড → উইথড্র → পরিমাণ লিখুন → বিকাশ/নগদ/মোবাইল রিচার্জ বেছে নিন → নম্বর দিন।\n\n"
+            "সর্বনিম্ন উইথড্র ৳১০। প্রতিটি উইথড্র/রিচার্জে ১৫% ফি। উদাহরণ: ৳১০০ থেকে ফি ৳১৫, পাবেন ৳৮৫।\n\n"
+            "পেমেন্ট রিসিভারের নম্বর অ্যাডমিনের কাছ থেকে নিশ্চিত করুন; এখানে কোনো নম্বর অনুমান করে দেখানো হচ্ছে না।"
+        )
     elif t=="📜 নিয়মাবলি":
         await update.effective_message.reply_text("• কাজের দাম ক্যাটাগরি মিনিমামের কম নয় (কোনোটিই ৳২-এর নিচে নয়)।\n• ভুয়া অ্যাকাউন্ট, প্রতারণা, স্প্যাম বা প্ল্যাটফর্মের নিয়মভঙ্গকারী কাজ নিষিদ্ধ।\n• বাজেট আগে বায়ার ব্যালেন্স থেকে সংরক্ষিত হবে।\n• প্রুফ অ্যাডমিন অনুমোদন করলে ফ্রিল্যান্সার টাকা পাবেন।\n• ডিপোজিট/উইথড্র ম্যানুয়ালি যাচাই হয়।")
     elif t=="🆘 সাহায্য":
@@ -176,10 +187,16 @@ async def stage_input(update,ctx,st,t):
         a=amount(t)
         if a is None or a<10: await msg.reply_text("সর্বনিম্ন ৳১০ লিখুন।"); return
         ctx.user_data["form"]={"amount":str(a)}; ctx.user_data["stage"]="dep_method"
-        await msg.reply_text("bKash অথবা Nagad লিখুন।")
+        await msg.reply_text("ডিপোজিটের পদ্ধতি বেছে নিন:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟣 বিকাশ (bKash)",callback_data="depmethod:bKash"),InlineKeyboardButton("🟠 নগদ (Nagad)",callback_data="depmethod:Nagad")]]))
     elif st=="dep_method":
-        if t not in ("bKash","Nagad"): await msg.reply_text("bKash অথবা Nagad লিখুন।"); return
-        ctx.user_data["form"]["method"]=t; ctx.user_data["stage"]="dep_txn"; await msg.reply_text("Transaction ID লিখুন।")
+        aliases={"বিকাশ":"bKash","বিকাশ (bKash)":"bKash","নগদ":"Nagad","নগদ (Nagad)":"Nagad","bKash":"bKash","Nagad":"Nagad"}
+        method=aliases.get(t)
+        if method not in ("bKash","Nagad"):
+            await msg.reply_text("নিচের বাটন থেকে বিকাশ অথবা নগদ বেছে নিন।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟣 বিকাশ (bKash)",callback_data="depmethod:bKash"),InlineKeyboardButton("🟠 নগদ (Nagad)",callback_data="depmethod:Nagad")]]))
+            return
+        ctx.user_data["form"]["method"]=method; ctx.user_data["stage"]="dep_txn"; await msg.reply_text("পেমেন্টের Transaction ID লিখুন।")
     elif st=="dep_txn":
         f=ctx.user_data["form"]
         try:
@@ -195,10 +212,21 @@ async def stage_input(update,ctx,st,t):
         with conn() as c: r=c.execute("SELECT worker FROM users WHERE id=?",(uid,)).fetchone()
         if Decimal(r["worker"] or 0)<g: await msg.reply_text(f"ব্যালেন্স কম। আপনার ব্যালেন্স ৳{m(r['worker'])}।"); return
         ctx.user_data["form"]={"gross":str(g),"fee":str(fee),"net":str(net)}; ctx.user_data["stage"]="wd_method"
-        await msg.reply_text(f"মোট ৳{m(g)} | ১৫% ফি ৳{m(fee)} | পাবেন ৳{m(net)}\nbKash, Nagad অথবা Recharge লিখুন।")
+        await msg.reply_text(
+            f"🧾 উইথড্র হিসাব\nমোট: ৳{m(g)}\nসার্ভিস ফি (১৫%): ৳{m(fee)}\nআপনি পাবেন: ৳{m(net)}\n\n"
+            "নিচের বাটন থেকে পেমেন্ট পদ্ধতি বেছে নিন।",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟣 বিকাশ",callback_data="wdmethod:bKash"),InlineKeyboardButton("🟠 নগদ",callback_data="wdmethod:Nagad")],[InlineKeyboardButton("📱 মোবাইল রিচার্জ",callback_data="wdmethod:Recharge")]])
+        )
     elif st=="wd_method":
-        if t not in ("bKash","Nagad","Recharge"): await msg.reply_text("bKash, Nagad অথবা Recharge লিখুন।"); return
-        ctx.user_data["form"]["method"]=t; ctx.user_data["stage"]="wd_account"; await msg.reply_text("মোবাইল/অ্যাকাউন্ট নম্বর লিখুন।")
+        aliases={"বিকাশ":"bKash","বিকাশ (bKash)":"bKash","নগদ":"Nagad","নগদ (Nagad)":"Nagad","মোবাইল রিচার্জ":"Recharge","রিচার্জ":"Recharge","bKash":"bKash","Nagad":"Nagad","Recharge":"Recharge"}
+        method=aliases.get(t)
+        if method not in ("bKash","Nagad","Recharge"):
+            await msg.reply_text("নিচের বাটন থেকে পেমেন্ট পদ্ধতি বেছে নিন।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟣 বিকাশ",callback_data="wdmethod:bKash"),InlineKeyboardButton("🟠 নগদ",callback_data="wdmethod:Nagad")],[InlineKeyboardButton("📱 মোবাইল রিচার্জ",callback_data="wdmethod:Recharge")]]))
+            return
+        ctx.user_data["form"]["method"]=method; ctx.user_data["stage"]="wd_account"
+        label={"bKash":"বিকাশ","Nagad":"নগদ","Recharge":"মোবাইল রিচার্জ"}[method]
+        await msg.reply_text(f"পেমেন্ট পদ্ধতি: {label}\nএখন আপনার মোবাইল/অ্যাকাউন্ট নম্বর লিখুন।")
     elif st=="wd_account":
         if len(t)<8 or len(t)>40: await msg.reply_text("সঠিক নম্বর লিখুন।"); return
         f=ctx.user_data["form"]; g=Decimal(f["gross"])
@@ -236,6 +264,21 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         except: return
         ctx.user_data["form"]={"cat":ci}; ctx.user_data["stage"]="job_title"
         await q.message.reply_text(f"ক্যাটাগরি: {name}\nসর্বনিম্ন দাম ৳{mi}\nকাজের শিরোনাম লিখুন।")
+    elif d.startswith("wdmethod:"):
+        if ctx.user_data.get("stage")!="wd_method" or not ctx.user_data.get("form"):
+            await q.message.reply_text("এই উইথড্র ফর্মটি আর সক্রিয় নেই। আবার উইথড্র শুরু করুন।"); return
+        method=d.split(":",1)[1]
+        if method not in ("bKash","Nagad","Recharge"): return
+        ctx.user_data["form"]["method"]=method; ctx.user_data["stage"]="wd_account"
+        label={"bKash":"বিকাশ","Nagad":"নগদ","Recharge":"মোবাইল রিচার্জ"}[method]
+        await q.message.reply_text(f"পেমেন্ট পদ্ধতি: {label}\nএখন আপনার মোবাইল/অ্যাকাউন্ট নম্বর লিখুন।")
+    elif d.startswith("depmethod:"):
+        if ctx.user_data.get("stage")!="dep_method" or not ctx.user_data.get("form"):
+            await q.message.reply_text("এই ডিপোজিট ফর্মটি আর সক্রিয় নেই। আবার ডিপোজিট শুরু করুন।"); return
+        method=d.split(":",1)[1]
+        if method not in ("bKash","Nagad"): return
+        ctx.user_data["form"]["method"]=method; ctx.user_data["stage"]="dep_txn"
+        await q.message.reply_text(f"পেমেন্ট পদ্ধতি: {'বিকাশ' if method=='bKash' else 'নগদ'}\nএখন Transaction ID লিখুন।")
     elif d=="job:no":
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); await q.message.reply_text("কাজ পোস্ট বাতিল।")
     elif d=="job:yes":
