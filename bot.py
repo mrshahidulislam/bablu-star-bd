@@ -1,939 +1,1200 @@
+
 import os
 import sqlite3
+import logging
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = os.getenv("DB_NAME", "bablu_star.db")
-REFERRAL_PERCENT = 10.0
+# ======================================
+# BABLU STAR BD - PART 1 OF 2
+# Configuration, database and helpers
+# ======================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+DB_PATH = os.getenv("DB_PATH", "bablu_star_bd.db")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+
+if not ADMIN_ID_RAW.isdigit():
+    raise RuntimeError("ADMIN_ID must be a numeric Telegram user ID.")
+
+ADMIN_ID = int(ADMIN_ID_RAW)
+
+FEE_RATE = Decimal("0.15")
+REFERRAL_RATE = Decimal("0.10")
+USD_TO_BDT = Decimal("100")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("bablu_star_bd")
 
 
 def now():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect():
-    con = sqlite3.connect(DB_NAME, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA busy_timeout=30000")
-    return con
+def amount(value):
+    return Decimal(str(value)).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+
+
+def taka(value):
+    return f"৳{amount(value):,.2f}"
+
+
+def payout_calculation(gross):
+    gross = amount(gross)
+    fee = amount(gross * FEE_RATE)
+    net = amount(gross - fee)
+    return gross, fee, net
+
+
+def connect_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 
 def init_db():
-    with connect() as con:
-        con.executescript("""
+    with connect_db() as conn:
+        conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            balance REAL NOT NULL DEFAULT 0
+            username TEXT NOT NULL DEFAULT '',
+            full_name TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT 'freelancer'
+                CHECK(mode IN ('buyer', 'freelancer')),
+            buyer_balance TEXT NOT NULL DEFAULT '0.00',
+            freelancer_balance TEXT NOT NULL DEFAULT '0.00',
+            referred_by INTEGER,
+            referral_paid INTEGER NOT NULL DEFAULT 0,
+            banned INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER PRIMARY KEY AUTOINCREMENT,
             buyer_id INTEGER NOT NULL,
             title TEXT NOT NULL,
             description TEXT NOT NULL,
-            reward REAL NOT NULL CHECK(reward > 0),
-            status TEXT NOT NULL DEFAULT 'open'
+            task_count INTEGER NOT NULL CHECK(task_count >= 0),
+            price_per_task TEXT NOT NULL,
+            reserved_budget TEXT NOT NULL,
+            rules TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(buyer_id) REFERENCES users(user_id)
         );
 
         CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id INTEGER NOT NULL,
-            worker_id INTEGER NOT NULL,
+            freelancer_id INTEGER NOT NULL,
             proof TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            review_reason TEXT DEFAULT '',
-            reviewed_by INTEGER,
+            created_at TEXT NOT NULL,
             reviewed_at TEXT,
-            UNIQUE(job_id, worker_id)
+            UNIQUE(job_id, freelancer_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(job_id),
+            FOREIGN KEY(freelancer_id) REFERENCES users(user_id)
         );
 
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT NOT NULL,
-            banned_by INTEGER NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS appeals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            submission_id INTEGER UNIQUE NOT NULL,
-            worker_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            evidence TEXT DEFAULT '',
+        CREATE TABLE IF NOT EXISTS deposits (
+            deposit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount TEXT NOT NULL,
+            method TEXT NOT NULL,
+            transaction_id TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'pending',
-            decided_by INTEGER,
-            decision_reason TEXT DEFAULT '',
             created_at TEXT NOT NULL,
-            decided_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            submission_id INTEGER UNIQUE NOT NULL,
-            worker_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS referrals (
-            referred_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER NOT NULL,
-            bonus_paid INTEGER NOT NULL DEFAULT 0,
-            bonus_amount REAL NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            bonus_paid_at TEXT
+            reviewed_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
         );
 
         CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            amount REAL NOT NULL CHECK(amount > 0),
+            balance_type TEXT NOT NULL,
+            gross TEXT NOT NULL,
+            fee TEXT NOT NULL,
+            net TEXT NOT NULL,
             method TEXT NOT NULL,
             account TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            reviewed_by INTEGER,
-            review_reason TEXT DEFAULT '',
             created_at TEXT NOT NULL,
-            reviewed_at TEXT
+            reviewed_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
         );
 
-        CREATE TABLE IF NOT EXISTS withdrawal_referral_bonus (
-            referred_id INTEGER PRIMARY KEY,
-            withdrawal_id INTEGER UNIQUE NOT NULL,
-            referrer_id INTEGER NOT NULL,
-            withdrawal_amount REAL NOT NULL,
-            bonus_amount REAL NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor_id INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS audit_log (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER,
             action TEXT NOT NULL,
-            target_id INTEGER,
-            details TEXT DEFAULT '',
+            details TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         """)
 
-        # Migrate older versions of these tables safely.
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(submissions)")}
-        for name, declaration in (
-            ("review_reason", "TEXT DEFAULT ''"),
-            ("reviewed_by", "INTEGER"),
-            ("reviewed_at", "TEXT"),
-        ):
-            if name not in cols:
-                con.execute(f"ALTER TABLE submissions ADD COLUMN {name} {declaration}")
 
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(referrals)")}
-        for name, declaration in (
-            ("bonus_paid", "INTEGER NOT NULL DEFAULT 0"),
-            ("bonus_amount", "REAL NOT NULL DEFAULT 0"),
-            ("bonus_paid_at", "TEXT"),
-        ):
-            if name not in cols:
-                con.execute(f"ALTER TABLE referrals ADD COLUMN {name} {declaration}")
+def audit(actor_id, action, details=""):
+    with connect_db() as conn:
+        conn.execute(
+            """INSERT INTO audit_log
+               (actor_id, action, details, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (actor_id, action, details, now()),
+        )
 
 
-def log_action(con, actor, action, target=None, details=""):
-    con.execute(
-        """INSERT INTO audit_logs(actor_id, action, target_id, details, created_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (actor, action, target, details, now()),
-    )
+def get_user(user_id):
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def ensure_user(tg_user, referral_id=None):
+    if referral_id == tg_user.id:
+        referral_id = None
+
+    with connect_db() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO users
+               (user_id, username, full_name, referred_by, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                tg_user.id,
+                tg_user.username or "",
+                tg_user.full_name or "",
+                referral_id,
+                now(),
+            ),
+        )
+
+        conn.execute(
+            """UPDATE users SET username=?, full_name=?
+               WHERE user_id=?""",
+            (tg_user.username or "", tg_user.full_name or "", tg_user.id),
+        )
+
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (tg_user.id,),
+        ).fetchone()
 
 
 def is_admin(user_id):
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+    return user_id == ADMIN_ID
 
 
-def banned(user_id):
-    with connect() as con:
-        return con.execute(
-            "SELECT 1 FROM banned_users WHERE user_id=?", (user_id,)
-        ).fetchone() is not None
+def is_blocked(user_id):
+    user = get_user(user_id)
+    return user is None or bool(user["banned"])
 
 
-async def allowed(update):
-    user = update.effective_user
-    if not user:
-        return False
-    if banned(user.id) and not is_admin(user.id):
-        await update.effective_message.reply_text(
-            "⛔ আপনার অ্যাকাউন্ট Ban করা হয়েছে। Admin-এর সঙ্গে যোগাযোগ করুন।"
+def main_menu(mode):
+    if mode == "buyer":
+        rows = [
+            ["➕ কাজ পোস্ট", "📋 আমার কাজ"],
+            ["💰 ব্যালেন্স", "➕ ডিপোজিট"],
+            ["💸 উত্তোলন", "🔄 Freelancer Mode"],
+            ["👥 রেফার", "ℹ️ সাহায্য"],
+        ]
+    else:
+        rows = [
+            ["🔎 কাজ খুঁজুন", "📨 আমার সাবমিশন"],
+            ["💰 ব্যালেন্স", "➕ ডিপোজিট"],
+            ["💸 উত্তোলন", "🔄 Buyer Mode"],
+            ["👥 রেফার", "ℹ️ সাহায্য"],
+        ]
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "💳 Pending Deposits",
+            callback_data="admin:deposits",
+        )],
+        [InlineKeyboardButton(
+            "💸 Pending Withdrawals",
+            callback_data="admin:withdrawals",
+        )],
+        [InlineKeyboardButton(
+            "📋 Pending Submissions",
+            callback_data="admin:submissions",
+        )],
+        [InlineKeyboardButton(
+            "📊 Finance Summary",
+            callback_data="admin:finance",
+        )],
+    ])
+
+
+# END OF PART 1
+# Add PART 2 directly below this line.
+
+# ======================================
+# BABLU STAR BD - PART 2 OF 2
+# Menus, jobs, deposits, withdrawals,
+# referrals, admin actions and startup
+# ======================================
+
+from telegram.error import TelegramError
+
+
+# Add a column to existing databases safely.
+def migrate_db():
+    with connect_db() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(deposits)")
+        }
+        if "balance_type" not in columns:
+            conn.execute(
+                "ALTER TABLE deposits ADD COLUMN "
+                "balance_type TEXT NOT NULL DEFAULT 'freelancer'"
+            )
+
+
+def set_mode(user_id, mode):
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE users SET mode=? WHERE user_id=?",
+            (mode, user_id),
         )
-        return False
-    return True
 
 
-def register_user(user):
-    with connect() as con:
-        con.execute(
-            """INSERT INTO users(user_id, username) VALUES (?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET username=excluded.username""",
-            (user.id, user.username or user.first_name or ""),
+def add_balance(user_id, balance_type, value):
+    column = (
+        "buyer_balance"
+        if balance_type == "buyer"
+        else "freelancer_balance"
+    )
+    with connect_db() as conn:
+        row = conn.execute(
+            f"SELECT {column} AS bal FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return
+        new_value = amount(Decimal(row["bal"]) + amount(value))
+        conn.execute(
+            f"UPDATE users SET {column}=? WHERE user_id=?",
+            (str(new_value), user_id),
         )
 
 
-def register_referral(con, new_user_id, start_parameter):
-    if not start_parameter or not start_parameter.startswith("ref_"):
-        return
+def balance_text(user_id):
+    user = get_user(user_id)
+    return (
+        "💰 আপনার ব্যালেন্স\n\n"
+        f"🛒 Buyer Balance: {taka(user['buyer_balance'])}\n"
+        f"👨‍💻 Freelancer Balance: {taka(user['freelancer_balance'])}"
+    )
+
+
+async def safe_send(context, user_id, text, **kwargs):
     try:
-        referrer_id = int(start_parameter[4:])
-    except ValueError:
-        return
-    if referrer_id == new_user_id or referrer_id <= 0:
-        return
-    # A referral is recorded only on the user's first registration.
-    exists = con.execute(
-        "SELECT 1 FROM users WHERE user_id=?", (new_user_id,)
-    ).fetchone()
-    if not exists:
-        return
-    con.execute(
-        """INSERT OR IGNORE INTO referrals
-           (referred_id, referrer_id, bonus_paid, bonus_amount, created_at)
-           VALUES (?, ?, 0, 0, ?)""",
-        (new_user_id, referrer_id, now()),
-    )
-
-
-def pay_worker(con, submission, reward):
-    # Unique submission_id in transactions prevents duplicate job payments.
-    existing = con.execute(
-        "SELECT 1 FROM transactions WHERE submission_id=?", (submission["id"],)
-    ).fetchone()
-    if existing:
-        return False
-    con.execute(
-        """INSERT INTO users(user_id, username, balance) VALUES (?, '', 0)
-           ON CONFLICT(user_id) DO NOTHING""",
-        (submission["worker_id"],),
-    )
-    con.execute(
-        """INSERT INTO transactions(submission_id, worker_id, amount, created_at)
-           VALUES (?, ?, ?, ?)""",
-        (submission["id"], submission["worker_id"], reward, now()),
-    )
-    con.execute(
-        "UPDATE users SET balance=balance+? WHERE user_id=?",
-        (reward, submission["worker_id"]),
-    )
-    return True
-
-
-def pay_referral_bonus_for_first_approved_withdrawal(con, withdrawal):
-    """Pay 10% of the first approved withdrawal, once per referred user."""
-    user_id = withdrawal["user_id"]
-    ref = con.execute(
-        "SELECT * FROM referrals WHERE referred_id=?", (user_id,)
-    ).fetchone()
-    if not ref or ref["bonus_paid"]:
-        return None
-
-    # This unique key also protects against duplicate bonuses.
-    already = con.execute(
-        "SELECT 1 FROM withdrawal_referral_bonus WHERE referred_id=?", (user_id,)
-    ).fetchone()
-    if already:
-        con.execute(
-            "UPDATE referrals SET bonus_paid=1 WHERE referred_id=?", (user_id,)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            **kwargs,
         )
-        return None
-
-    if con.execute(
-        "SELECT 1 FROM banned_users WHERE user_id=?", (ref["referrer_id"],)
-    ).fetchone():
-        # Keep unpaid; admin can unban then process only if a separate retry feature is added.
-        return None
-
-    bonus = round(float(withdrawal["amount"]) * REFERRAL_PERCENT / 100.0, 2)
-    if bonus <= 0:
-        return None
-
-    con.execute(
-        """INSERT INTO users(user_id, username, balance) VALUES (?, '', 0)
-           ON CONFLICT(user_id) DO NOTHING""",
-        (ref["referrer_id"],),
-    )
-    con.execute(
-        "UPDATE users SET balance=balance+? WHERE user_id=?",
-        (bonus, ref["referrer_id"]),
-    )
-    con.execute(
-        """INSERT INTO withdrawal_referral_bonus
-           (referred_id, withdrawal_id, referrer_id, withdrawal_amount,
-            bonus_amount, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            user_id, withdrawal["id"], ref["referrer_id"],
-            withdrawal["amount"], bonus, now()
-        ),
-    )
-    con.execute(
-        """UPDATE referrals SET bonus_paid=1, bonus_amount=?, bonus_paid_at=?
-           WHERE referred_id=? AND bonus_paid=0""",
-        (bonus, now(), user_id),
-    )
-    log_action(
-        con, 0, "REFERRAL_BONUS_PAID", ref["referrer_id"],
-        f"referred={user_id}; withdrawal={withdrawal['id']}; bonus={bonus}"
-    )
-    return (ref["referrer_id"], bonus)
+    except TelegramError:
+        logger.warning("Could not message Telegram user %s", user_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    existed = False
-    with connect() as con:
-        existed = con.execute(
-            "SELECT 1 FROM users WHERE user_id=?", (user.id,)
-        ).fetchone() is not None
-        con.execute(
-            """INSERT INTO users(user_id, username) VALUES (?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET username=excluded.username""",
-            (user.id, user.username or user.first_name or ""),
-        )
-        if not existed:
-            start_arg = context.args[0] if context.args else ""
-            register_referral(con, user.id, start_arg)
+    tg = update.effective_user
+    ref_id = None
 
-    if not await allowed(update):
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_") and arg[4:].isdigit():
+            ref_id = int(arg[4:])
+
+    user = ensure_user(tg, ref_id)
+
+    if is_blocked(tg.id):
+        await update.message.reply_text("⛔ আপনার অ্যাকাউন্ট বন্ধ আছে।")
         return
 
     await update.message.reply_text(
         "⭐ BABLU STAR BD-তে স্বাগতম!\n\n"
-        "/me — আপনার তথ্য\n/balance — ব্যালেন্স\n/jobs — কাজ দেখুন\n"
-        "/postjob শিরোনাম | বিবরণ | পুরস্কার\n"
-        "/submit JOB_ID | প্রমাণ/লিংক\n/myjobs — পোস্ট করা কাজ\n"
-        "/reviews — জমা কাজ\n/refer — রেফার লিংক ও রিপোর্ট\n"
-        "/withdraw AMOUNT | METHOD | ACCOUNT — উত্তোলন আবেদন\n"
-        "/mywithdrawals — উত্তোলনের অবস্থা\n/help — সব কমান্ড"
+        "একটি মোড বেছে নিয়ে কাজ শুরু করুন।\n"
+        "💱 হিসাব: 1 USD = ৳100\n"
+        "💸 উত্তোলন ফি: 15%",
+        reply_markup=main_menu(user["mode"]),
     )
 
 
-async def help_cmd(update, context):
-    if not await allowed(update):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ BABLU STAR BD সাহায্য\n\n"
+        "• Buyer Mode-এ কাজ পোস্ট করুন।\n"
+        "• Freelancer Mode-এ কাজ করে প্রমাণ জমা দিন।\n"
+        "• ডিপোজিট অ্যাডমিন যাচাই করার পর ব্যালেন্সে যোগ হবে।\n"
+        "• উত্তোলনে 15% ফি কাটা হবে।\n"
+        "• পেমেন্ট ম্যানুয়ালি যাচাই করা হয়; স্বয়ংক্রিয় পেমেন্ট নয়।\n"
+        "• প্রতারণা বা ভুয়া প্রমাণ দিলে অ্যাকাউন্ট বন্ধ হতে পারে।\n\n"
+        "সমস্যা হলে অ্যাডমিনের সঙ্গে যোগাযোগ করুন।"
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ অনুমতি নেই।")
         return
     await update.message.reply_text(
-        "সাধারণ কমান্ড:\n/start /help /me /balance /jobs /postjob /submit "
-        "/myjobs /reviews /refer /withdraw /mywithdrawals /appeal\n\n"
-        "Admin:\n/admin /review /appeals /decideappeal /withdrawals "
-        "/decidewithdrawal /ban /unban /audit"
+        "🛠 Admin Panel",
+        reply_markup=admin_keyboard(),
     )
 
 
-async def me(update, context):
-    if not await allowed(update):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
         return
-    user = update.effective_user
-    register_user(user)
-    with connect() as con:
-        row = con.execute(
-            "SELECT balance FROM users WHERE user_id=?", (user.id,)
-        ).fetchone()
-    await update.message.reply_text(
-        f"👤 {user.first_name}\n🆔 ID: {user.id}\n"
-        f"💰 ব্যালেন্স: ৳{row['balance']:.2f}\n"
-        f"🔐 ভূমিকা: {'Admin' if is_admin(user.id) else 'User'}"
-    )
 
-
-async def balance(update, context):
-    if not await allowed(update):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not user or is_blocked(uid):
+        await msg.reply_text("⛔ অ্যাকাউন্ট ব্যবহার করা যাচ্ছে না।")
         return
-    with connect() as con:
-        row = con.execute(
-            "SELECT balance FROM users WHERE user_id=?",
-            (update.effective_user.id,),
-        ).fetchone()
-    await update.message.reply_text(
-        f"💰 ব্যালেন্স: ৳{(row['balance'] if row else 0):.2f}"
-    )
 
+    text = msg.text.strip()
+    stage = context.user_data.get("stage")
 
-async def postjob(update, context):
-    if not await allowed(update):
+    # ----- Step-by-step user flows -----
+    if stage:
+        await process_stage(update, context, stage, text)
         return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 2)]
-    if len(parts) != 3:
-        await update.message.reply_text(
-            "ব্যবহার: /postjob শিরোনাম | বিবরণ | পুরস্কার"
+
+    if text == "🔄 Buyer Mode":
+        set_mode(uid, "buyer")
+        await msg.reply_text("🛒 Buyer Mode চালু হয়েছে।",
+                             reply_markup=main_menu("buyer"))
+        return
+
+    if text == "🔄 Freelancer Mode":
+        set_mode(uid, "freelancer")
+        await msg.reply_text("👨‍💻 Freelancer Mode চালু হয়েছে।",
+                             reply_markup=main_menu("freelancer"))
+        return
+
+    if text == "💰 ব্যালেন্স":
+        await msg.reply_text(balance_text(uid))
+        return
+
+    if text == "ℹ️ সাহায্য":
+        await help_command(update, context)
+        return
+
+    if text == "👥 রেফার":
+        me = await context.bot.get_me()
+        await msg.reply_text(
+            "👥 আপনার রেফারেল লিংক:\n"
+            f"https://t.me/{me.username}?start=ref_{uid}\n\n"
+            "আপনার রেফার করা ব্যক্তির প্রথম অনুমোদিত "
+            "উত্তোলনের মোট অঙ্কের 10% একবার বোনাস পাবেন।"
         )
         return
-    title, description, reward_text = parts
-    try:
-        reward = float(reward_text)
-        if not 0 < reward <= 1_000_000:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("পুরস্কারের পরিমাণ সঠিক নয়।")
-        return
-    user = update.effective_user
-    with connect() as con:
-        cur = con.execute(
-            """INSERT INTO jobs(buyer_id, title, description, reward, status)
-               VALUES (?, ?, ?, ?, 'open')""",
-            (user.id, title, description, reward),
+
+    if text == "➕ ডিপোজিট":
+        context.user_data["stage"] = "deposit_amount"
+        await msg.reply_text(
+            "কত টাকা ডিপোজিট করতে চান? শুধু সংখ্যায় লিখুন।"
         )
-        job_id = cur.lastrowid
-        log_action(con, user.id, "POST_JOB", job_id, title)
-    await update.message.reply_text(
-        f"✅ কাজ পোস্ট হয়েছে!\nJob ID: {job_id}\n{title}\nপুরস্কার: ৳{reward:.2f}"
-    )
-
-
-async def jobs(update, context):
-    if not await allowed(update):
         return
-    with connect() as con:
-        rows = con.execute(
-            "SELECT * FROM jobs WHERE status='open' ORDER BY id DESC LIMIT 20"
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("এখন কোনো খোলা কাজ নেই।")
-        return
-    for j in rows:
-        await update.message.reply_text(
-            f"📌 Job #{j['id']}: {j['title']}\n{j['description']}\n"
-            f"💰 ৳{j['reward']:.2f}\n"
-            f"/submit {j['id']} | আপনার প্রমাণ/লিংক"
+
+    if text == "💸 উত্তোলন":
+        context.user_data["stage"] = "withdraw_amount"
+        await msg.reply_text(
+            "কত টাকা উত্তোলন করতে চান? শুধু সংখ্যায় লিখুন।"
         )
+        return
 
+    if text == "➕ কাজ পোস্ট":
+        if user["mode"] != "buyer":
+            await msg.reply_text("আগে Buyer Mode চালু করুন।")
+            return
+        context.user_data["stage"] = "job_title"
+        await msg.reply_text("কাজের শিরোনাম লিখুন।")
+        return
 
-async def submit(update, context):
-    if not await allowed(update):
-        return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 1)]
-    if len(parts) != 2:
-        await update.message.reply_text("ব্যবহার: /submit JOB_ID | প্রমাণ/লিংক")
-        return
-    try:
-        job_id = int(parts[0])
-    except ValueError:
-        await update.message.reply_text("Job ID সঠিক নয়।")
-        return
-    user_id = update.effective_user.id
-    try:
-        with connect() as con:
-            job = con.execute(
-                "SELECT * FROM jobs WHERE id=? AND status='open'", (job_id,)
-            ).fetchone()
-            if not job:
-                await update.message.reply_text("কাজটি নেই বা বন্ধ।")
-                return
-            if job["buyer_id"] == user_id:
-                await update.message.reply_text("নিজের কাজে নিজে সাবমিট করা যাবে না।")
-                return
-            cur = con.execute(
-                """INSERT INTO submissions(job_id, worker_id, proof, status)
-                   VALUES (?, ?, ?, 'pending')""",
-                (job_id, user_id, parts[1]),
+    if text == "📋 আমার কাজ":
+        with connect_db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE buyer_id=? ORDER BY job_id DESC",
+                (uid,),
+            ).fetchall()
+        if not rows:
+            await msg.reply_text("আপনার কোনো কাজ নেই।")
+            return
+        for job in rows:
+            await msg.reply_text(
+                f"📋 Job #{job['job_id']}\n"
+                f"শিরোনাম: {job['title']}\n"
+                f"অবশিষ্ট টাস্ক: {job['task_count']}\n"
+                f"প্রতি টাস্ক: {taka(job['price_per_task'])}\n"
+                f"স্ট্যাটাস: {job['status']}"
             )
-            log_action(con, user_id, "SUBMIT_WORK", cur.lastrowid, f"job={job_id}")
-        await update.message.reply_text(f"✅ কাজ জমা হয়েছে। Submission ID: {cur.lastrowid}")
-    except sqlite3.IntegrityError:
-        await update.message.reply_text("এই কাজে আপনি আগেই সাবমিট করেছেন।")
-
-
-async def myjobs(update, context):
-    if not await allowed(update):
-        return
-    with connect() as con:
-        rows = con.execute(
-            "SELECT * FROM jobs WHERE buyer_id=? ORDER BY id DESC",
-            (update.effective_user.id,),
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("আপনি এখনো কাজ পোস্ট করেননি।")
-        return
-    for j in rows:
-        await update.message.reply_text(
-            f"Job #{j['id']} — {j['title']}\n৳{j['reward']:.2f} | {j['status']}"
-        )
-
-
-async def reviews(update, context):
-    if not await allowed(update):
-        return
-    with connect() as con:
-        rows = con.execute(
-            """SELECT s.*, j.title FROM submissions s
-               JOIN jobs j ON j.id=s.job_id
-               WHERE s.worker_id=? ORDER BY s.id DESC LIMIT 30""",
-            (update.effective_user.id,),
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("আপনার কোনো জমা কাজ নেই।")
-        return
-    for s in rows:
-        await update.message.reply_text(
-            f"Submission #{s['id']} — {s['title']}\nStatus: {s['status']}\n"
-            f"প্রমাণ: {s['proof']}\nকারণ: {s['review_reason'] or 'নেই'}"
-        )
-
-
-async def review(update, context):
-    if not await allowed(update):
-        return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 1)]
-    first = parts[0].split()
-    if len(first) < 2:
-        await update.message.reply_text(
-            "ব্যবহার: /review SUBMISSION_ID approve|reject | কারণ"
-        )
-        return
-    try:
-        sub_id = int(first[0])
-    except ValueError:
-        await update.message.reply_text("Submission ID সঠিক নয়।")
-        return
-    decision = first[1].lower()
-    reason = parts[1] if len(parts) > 1 else "কারণ উল্লেখ করা হয়নি"
-    if decision not in ("approve", "reject"):
-        await update.message.reply_text("approve অথবা reject লিখুন।")
         return
 
-    actor = update.effective_user.id
-    with connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        s = con.execute(
-            """SELECT s.*, j.buyer_id, j.reward FROM submissions s
-               JOIN jobs j ON j.id=s.job_id WHERE s.id=?""",
-            (sub_id,),
-        ).fetchone()
-        if not s:
-            await update.message.reply_text("Submission পাওয়া যায়নি।")
+    if text == "🔎 কাজ খুঁজুন":
+        if user["mode"] != "freelancer":
+            await msg.reply_text("আগে Freelancer Mode চালু করুন।")
             return
-        if not is_admin(actor) and s["buyer_id"] != actor:
-            await update.message.reply_text("শুধু সংশ্লিষ্ট Buyer বা Admin পারবেন।")
+        with connect_db() as conn:
+            jobs = conn.execute(
+                "SELECT * FROM jobs WHERE status='open' "
+                "AND task_count>0 ORDER BY job_id DESC LIMIT 20"
+            ).fetchall()
+        if not jobs:
+            await msg.reply_text("এখন কোনো কাজ খোলা নেই।")
             return
-        if s["status"] != "pending":
-            await update.message.reply_text("এই কাজের সিদ্ধান্ত ইতিমধ্যে হয়েছে।")
+        for job in jobs:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "📨 কাজ জমা দিন",
+                    callback_data=f"submit:{job['job_id']}",
+                )
+            ]])
+            await msg.reply_text(
+                f"📋 Job #{job['job_id']}\n"
+                f"শিরোনাম: {job['title']}\n"
+                f"বিবরণ: {job['description']}\n"
+                f"নিয়ম: {job['rules'] or 'নির্দিষ্ট নিয়ম নেই'}\n"
+                f"অবশিষ্ট টাস্ক: {job['task_count']}\n"
+                f"প্রতি টাস্ক: {taka(job['price_per_task'])}",
+                reply_markup=keyboard,
+            )
+        return
+
+    if text == "📨 আমার সাবমিশন":
+        with connect_db() as conn:
+            rows = conn.execute(
+                """SELECT s.*, j.title FROM submissions s
+                   JOIN jobs j ON j.job_id=s.job_id
+                   WHERE s.freelancer_id=? ORDER BY s.submission_id DESC
+                   LIMIT 20""",
+                (uid,),
+            ).fetchall()
+        if not rows:
+            await msg.reply_text("আপনার কোনো সাবমিশন নেই।")
             return
-        con.execute(
-            """UPDATE submissions SET status=?, review_reason=?, reviewed_by=?, reviewed_at=?
-               WHERE id=?""",
-            (decision, reason, actor, now(), sub_id),
-        )
-        if decision == "approve":
-            pay_worker(con, s, s["reward"])
-        log_action(con, actor, "REVIEW_SUBMISSION", sub_id, f"{decision}: {reason}")
-    await update.message.reply_text(f"Submission #{sub_id}: {decision}\nকারণ: {reason}")
+        for row in rows:
+            await msg.reply_text(
+                f"📨 {row['title']}\n"
+                f"Submission #{row['submission_id']}\n"
+                f"স্ট্যাটাস: {row['status']}"
+            )
+        return
+
+    await msg.reply_text(
+        "মেনু থেকে একটি অপশন বেছে নিন।",
+        reply_markup=main_menu(user["mode"]),
+    )
 
 
-async def appeal(update, context):
-    if not await allowed(update):
+async def process_stage(update, context, stage, text):
+    msg = update.message
+    uid = update.effective_user.id
+
+    def stop_stage():
+        context.user_data.pop("stage", None)
+
+    if stage in ("deposit_amount", "withdraw_amount",
+                 "job_price", "job_count"):
+        try:
+            value = amount(text)
+            if value <= 0:
+                raise ValueError
+            if stage in ("job_count",) and value != value.to_integral_value():
+                raise ValueError
+        except Exception:
+            await msg.reply_text("সঠিক ধনাত্মক সংখ্যা লিখুন।")
+            return
+
+    if stage == "deposit_amount":
+        context.user_data["deposit_amount"] = str(value)
+        context.user_data["stage"] = "deposit_method"
+        await msg.reply_text("পদ্ধতি লিখুন: bKash অথবা Nagad")
         return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 2)]
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "ব্যবহার: /appeal SUBMISSION_ID | কারণ | প্রমাণ/লিংক"
+
+    if stage == "deposit_method":
+        method = text.lower()
+        if method not in ("bkash", "nagad", "বিকাশ", "নগদ"):
+            await msg.reply_text("bKash অথবা Nagad লিখুন।")
+            return
+        context.user_data["deposit_method"] = method
+        context.user_data["stage"] = "deposit_balance"
+        await msg.reply_text(
+            "কোন ব্যালেন্সে জমা হবে?\n"
+            "buyer অথবা freelancer লিখুন।"
         )
         return
-    try:
-        sub_id = int(parts[0])
-    except ValueError:
-        await update.message.reply_text("Submission ID সঠিক নয়।")
-        return
-    reason = parts[1]
-    evidence = parts[2] if len(parts) > 2 else ""
-    with connect() as con:
-        s = con.execute(
-            "SELECT * FROM submissions WHERE id=?", (sub_id,)
-        ).fetchone()
-        if not s or s["worker_id"] != update.effective_user.id:
-            await update.message.reply_text("এই Submission আপনার নয় বা নেই।")
+
+    if stage == "deposit_balance":
+        balance_type = text.lower()
+        if balance_type not in ("buyer", "freelancer"):
+            await msg.reply_text("buyer অথবা freelancer লিখুন।")
             return
-        if s["status"] != "rejected":
-            await update.message.reply_text("শুধু বাতিল কাজের বিরুদ্ধে আপিল করা যাবে।")
+        context.user_data["deposit_balance"] = balance_type
+        context.user_data["stage"] = "deposit_txn"
+        await msg.reply_text(
+            "পেমেন্টের Transaction ID লিখুন।\n"
+            "অ্যাডমিন যাচাই না করা পর্যন্ত ব্যালেন্স যোগ হবে না।"
+        )
+        return
+
+    if stage == "deposit_txn":
+        txn = text.strip()
+        if len(txn) < 4 or len(txn) > 100:
+            await msg.reply_text("Transaction ID সঠিকভাবে লিখুন।")
             return
         try:
-            cur = con.execute(
-                """INSERT INTO appeals
-                   (submission_id, worker_id, reason, evidence, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (sub_id, update.effective_user.id, reason, evidence, now()),
-            )
+            with connect_db() as conn:
+                cur = conn.execute(
+                    """INSERT INTO deposits
+                       (user_id, amount, method, transaction_id,
+                        balance_type, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                    (
+                        uid,
+                        context.user_data["deposit_amount"],
+                        context.user_data["deposit_method"],
+                        txn,
+                        context.user_data["deposit_balance"],
+                        now(),
+                    ),
+                )
+                dep_id = cur.lastrowid
         except sqlite3.IntegrityError:
-            await update.message.reply_text("এই কাজের জন্য আগেই আপিল করেছেন।")
+            await msg.reply_text(
+                "❌ এই Transaction ID আগে জমা হয়েছে।"
+            )
+            stop_stage()
             return
-        log_action(con, update.effective_user.id, "FILE_APPEAL", cur.lastrowid, reason)
-    await update.message.reply_text(f"আপিল জমা হয়েছে। Appeal ID: {cur.lastrowid}")
-
-
-async def appeals_cmd(update, context):
-    if not await allowed(update):
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("শুধু Admin পারবেন।")
-        return
-    with connect() as con:
-        rows = con.execute(
-            """SELECT a.*, s.proof FROM appeals a
-               JOIN submissions s ON s.id=a.submission_id
-               WHERE a.status='pending' ORDER BY a.id"""
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("কোনো Pending appeal নেই।")
-        return
-    for a in rows:
-        await update.message.reply_text(
-            f"Appeal #{a['id']} | Submission #{a['submission_id']}\n"
-            f"Worker: {a['worker_id']}\nকারণ: {a['reason']}\n"
-            f"প্রমাণ: {a['evidence']}\nকাজের প্রমাণ: {a['proof']}\n"
-            f"/decideappeal {a['id']} approve | কারণ\n"
-            f"/decideappeal {a['id']} reject | কারণ"
+        audit(uid, "deposit_created", f"deposit={dep_id}")
+        stop_stage()
+        await msg.reply_text(
+            f"✅ ডিপোজিট রিকোয়েস্ট #{dep_id} জমা হয়েছে। "
+            "অ্যাডমিন যাচাই করবেন।"
         )
+        await safe_send(
+            context, ADMIN_ID,
+            f"💳 নতুন ডিপোজিট #{dep_id}\n"
+            f"User: {uid}\n"
+            f"Amount: {taka(context.user_data.get('deposit_amount', 0))}\n"
+            f"Transaction ID: {txn}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve",
+                                     callback_data=f"dep:ok:{dep_id}"),
+                InlineKeyboardButton("❌ Reject",
+                                     callback_data=f"dep:no:{dep_id}"),
+            ]]),
+        )
+        return
+
+    if stage == "withdraw_amount":
+        gross, fee, net = payout_calculation(value)
+        user = get_user(uid)
+        balance_type = user["mode"]
+        column = "buyer_balance" if balance_type == "buyer" else "freelancer_balance"
+        available = amount(user[column])
+        if gross > available:
+            await msg.reply_text(
+                f"ব্যালেন্স যথেষ্ট নয়। আছে {taka(available)}।"
+            )
+            return
+        context.user_data["withdraw_gross"] = str(gross)
+        context.user_data["withdraw_balance"] = balance_type
+        context.user_data["stage"] = "withdraw_method"
+        await msg.reply_text(
+            f"মোট: {taka(gross)}\n"
+            f"ফি 15%: {taka(fee)}\n"
+            f"আপনি পাবেন: {taka(net)}\n\n"
+            "পদ্ধতি লিখুন: bKash, Nagad অথবা recharge"
+        )
+        return
+
+    if stage == "withdraw_method":
+        method = text.lower()
+        valid = ("bkash", "nagad", "recharge", "বিকাশ", "নগদ", "মোবাইল রিচার্জ")
+        if method not in valid:
+            await msg.reply_text("bKash, Nagad অথবা recharge লিখুন।")
+            return
+        context.user_data["withdraw_method"] = method
+        context.user_data["stage"] = "withdraw_account"
+        await msg.reply_text(
+            "আপনার bKash/Nagad নম্বর অথবা রিচার্জের মোবাইল নম্বর লিখুন।"
+        )
+        return
+
+    if stage == "withdraw_account":
+        account = text.strip()
+        if len(account) < 5 or len(account) > 80:
+            await msg.reply_text("সঠিক নম্বর/অ্যাকাউন্ট লিখুন।")
+            return
+        gross, fee, net = payout_calculation(
+            context.user_data["withdraw_gross"]
+        )
+        balance_type = context.user_data["withdraw_balance"]
+        column = "buyer_balance" if balance_type == "buyer" else "freelancer_balance"
+
+        # Deduct atomically only if sufficient balance remains.
+        with connect_db() as conn:
+            row = conn.execute(
+                f"SELECT {column} AS bal FROM users WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+            if not row or amount(row["bal"]) < gross:
+                await msg.reply_text("ব্যালেন্স পরিবর্তিত হয়েছে; আবার চেষ্টা করুন।")
+                stop_stage()
+                return
+            new_balance = amount(Decimal(row["bal"]) - gross)
+            conn.execute(
+                f"UPDATE users SET {column}=? WHERE user_id=?",
+                (str(new_balance), uid),
+            )
+            cur = conn.execute(
+                """INSERT INTO withdrawals
+                   (user_id, balance_type, gross, fee, net, method,
+                    account, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (
+                    uid, balance_type, str(gross), str(fee), str(net),
+                    context.user_data["withdraw_method"], account, now(),
+                ),
+            )
+            wid = cur.lastrowid
+
+        audit(uid, "withdrawal_created", f"withdrawal={wid}")
+        stop_stage()
+        await msg.reply_text(
+            "আপনার পেমেন্ট রিকুয়েস্ট সফলভাবে জমা হয়েছে। "
+            "অনুগ্রহ করে অপেক্ষা করুন। আপনার পেমেন্ট রিকুয়েস্ট জমা "
+            "দেওয়ার সময় থেকে সর্বোচ্চ ৪৮ ঘণ্টার মধ্যে পেমেন্ট "
+            "সম্পন্ন করা হবে। ধৈর্য ধরে অপেক্ষা করার জন্য আপনাকে ধন্যবাদ। "
+            "— BABLU STAR BD"
+        )
+        await safe_send(
+            context, ADMIN_ID,
+            f"💸 Withdrawal #{wid}\nUser: {uid}\n"
+            f"Gross: {taka(gross)}\nFee: {taka(fee)}\n"
+            f"Net: {taka(net)}\nMethod: {context.user_data.get('withdraw_method')}\n"
+            f"Account: {account}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Paid",
+                                     callback_data=f"wd:ok:{wid}"),
+                InlineKeyboardButton("❌ Reject",
+                                     callback_data=f"wd:no:{wid}"),
+            ]]),
+        )
+        return
+
+    if stage == "job_title":
+        if len(text) > 100:
+            await msg.reply_text("শিরোনাম সর্বোচ্চ 100 অক্ষরের হবে।")
+            return
+        context.user_data["job_title"] = text
+        context.user_data["stage"] = "job_description"
+        await msg.reply_text("কাজের বিবরণ লিখুন।")
+        return
+
+    if stage == "job_description":
+        context.user_data["job_description"] = text[:3000]
+        context.user_data["stage"] = "job_count"
+        await msg.reply_text("কতটি টাস্ক থাকবে? পূর্ণ সংখ্যা লিখুন।")
+        return
+
+    if stage == "job_count":
+        count = int(value)
+        if count != value.to_integral_value() or count > 10000:
+            await msg.reply_text("1 থেকে 10000-এর মধ্যে পূর্ণ সংখ্যা লিখুন।")
+            return
+        context.user_data["job_count"] = count
+        context.user_data["stage"] = "job_price"
+        await msg.reply_text("প্রতি টাস্কের মূল্য কত টাকা?")
+        return
+
+    if stage == "job_price":
+        price = amount(value)
+        count = int(context.user_data["job_count"])
+        budget = amount(price * count)
+        user = get_user(uid)
+        available = amount(user["buyer_balance"])
+        if budget > available:
+            await msg.reply_text(
+                f"মোট বাজেট {taka(budget)}; Buyer Balance "
+                f"{taka(available)}। আগে ডিপোজিট করুন।"
+            )
+            stop_stage()
+            return
+        context.user_data["job_price"] = str(price)
+        context.user_data["job_budget"] = str(budget)
+        context.user_data["stage"] = "job_rules"
+        await msg.reply_text(
+            f"মোট বাজেট: {taka(budget)}\n"
+            "প্রমাণ/নিয়ম/ডেডলাইন লিখুন।"
+        )
+        return
+
+    if stage == "job_rules":
+        rules = text[:3000]
+        count = int(context.user_data["job_count"])
+        price = amount(context.user_data["job_price"])
+        budget = amount(context.user_data["job_budget"])
+
+        with connect_db() as conn:
+            row = conn.execute(
+                "SELECT buyer_balance FROM users WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+            if not row or amount(row["buyer_balance"]) < budget:
+                await msg.reply_text("Buyer Balance যথেষ্ট নয়।")
+                stop_stage()
+                return
+
+            new_bal = amount(Decimal(row["buyer_balance"]) - budget)
+            conn.execute(
+                "UPDATE users SET buyer_balance=? WHERE user_id=?",
+                (str(new_bal), uid),
+            )
+            cur = conn.execute(
+                """INSERT INTO jobs
+                   (buyer_id, title, description, task_count,
+                    price_per_task, reserved_budget, rules,
+                    status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+                (
+                    uid, context.user_data["job_title"],
+                    context.user_data["job_description"], count,
+                    str(price), str(budget), rules, now(),
+                ),
+            )
+            job_id = cur.lastrowid
+
+        audit(uid, "job_created", f"job={job_id},budget={budget}")
+        stop_stage()
+        await msg.reply_text(
+            f"✅ কাজ পোস্ট হয়েছে!\nJob #{job_id}\n"
+            f"টাস্ক: {count}\nপ্রতি টাস্ক: {taka(price)}\n"
+            f"Escrow বাজেট: {taka(budget)}"
+        )
+        return
+
+    stop_stage()
+    await msg.reply_text("ধাপটি শেষ হয়েছে। মেনু থেকে আবার শুরু করুন।")
 
 
-async def decideappeal(update, context):
-    if not await allowed(update):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    data = query.data or ""
+
+    if data.startswith("submit:"):
+        user = get_user(uid)
+        if not user or user["mode"] != "freelancer" or is_blocked(uid):
+            await query.message.reply_text("Freelancer Mode চালু করুন।")
+            return
+        job_id = int(data.split(":")[1])
+        with connect_db() as conn:
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE job_id=? AND status='open' "
+                "AND task_count>0",
+                (job_id,),
+            ).fetchone()
+            if not job:
+                await query.message.reply_text("কাজটি আর খোলা নেই।")
+                return
+            if job["buyer_id"] == uid:
+                await query.message.reply_text("নিজের কাজে আবেদন করা যাবে না।")
+                return
+            exists = conn.execute(
+                "SELECT 1 FROM submissions WHERE job_id=? AND freelancer_id=?",
+                (job_id, uid),
+            ).fetchone()
+            if exists:
+                await query.message.reply_text("আপনি ইতিমধ্যে সাবমিশন দিয়েছেন।")
+                return
+        context.user_data["stage"] = "proof"
+        context.user_data["proof_job_id"] = job_id
+        await query.message.reply_text("আপনার কাজের প্রমাণ (লিংক/বিবরণ) পাঠান।")
         return
-    actor = update.effective_user.id
-    if not is_admin(actor):
-        await update.message.reply_text("শুধু Admin পারবেন।")
+
+    if data == "admin:deposits" or data == "admin:withdrawals" or \
+       data == "admin:submissions" or data == "admin:finance":
+        if not is_admin(uid):
+            await query.message.reply_text("⛔ অনুমতি নেই।")
+            return
+        await admin_action(query, context, data)
         return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 1)]
-    first = parts[0].split()
-    if len(first) < 2:
-        await update.message.reply_text("ব্যবহার: /decideappeal ID approve|reject | কারণ")
+
+    parts = data.split(":")
+    if len(parts) == 3 and parts[0] in ("dep", "wd", "sub"):
+        if not is_admin(uid):
+            await query.message.reply_text("⛔ অনুমতি নেই।")
+            return
+        kind, decision, raw_id = parts
+        if decision not in ("ok", "no", "accept", "reject"):
+            return
+        record_id = int(raw_id)
+        await review_record(query, context, kind, decision, record_id)
         return
+
+
+async def handle_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("stage") != "proof":
+        return
+    uid = update.effective_user.id
+    job_id = context.user_data.get("proof_job_id")
+    proof = update.message.text.strip() if update.message.text else ""
+    if not proof:
+        await update.message.reply_text("প্রমাণ হিসেবে টেক্সট বা লিংক পাঠান।")
+        return
+
     try:
-        appeal_id = int(first[0])
-    except ValueError:
-        await update.message.reply_text("Appeal ID সঠিক নয়।")
-        return
-    decision = first[1].lower()
-    reason = parts[1] if len(parts) > 1 else "Admin সিদ্ধান্ত"
-    if decision not in ("approve", "reject"):
-        await update.message.reply_text("approve অথবা reject লিখুন।")
+        with connect_db() as conn:
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE job_id=? AND status='open' AND task_count>0",
+                (job_id,),
+            ).fetchone()
+            if not job:
+                await update.message.reply_text("কাজটি আর খোলা নেই।")
+                context.user_data.pop("stage", None)
+                return
+            conn.execute(
+                """INSERT INTO submissions
+                   (job_id, freelancer_id, proof, status, created_at)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (job_id, uid, proof[:4000], now()),
+            )
+            sub = conn.execute(
+                "SELECT last_insert_rowid() AS id"
+            ).fetchone()["id"]
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("এই কাজে আপনার সাবমিশন আগে জমা হয়েছে।")
+        context.user_data.pop("stage", None)
         return
 
-    with connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        a = con.execute(
-            """SELECT a.*, s.status AS sub_status, s.worker_id AS sub_worker,
-                      j.reward FROM appeals a
-               JOIN submissions s ON s.id=a.submission_id
-               JOIN jobs j ON j.id=s.job_id WHERE a.id=?""",
-            (appeal_id,),
-        ).fetchone()
-        if not a or a["status"] != "pending":
-            await update.message.reply_text("আপিল নেই বা সিদ্ধান্ত দেওয়া হয়েছে।")
-            return
-        con.execute(
-            """UPDATE appeals SET status=?, decided_by=?, decision_reason=?, decided_at=?
-               WHERE id=?""",
-            (decision, actor, reason, now(), appeal_id),
-        )
-        if decision == "approve":
-            con.execute(
-                """UPDATE submissions SET status='approved', review_reason=?,
-                   reviewed_by=?, reviewed_at=? WHERE id=?""",
-                (reason, actor, now(), a["submission_id"]),
-            )
-            pay_worker(
-                con,
-                {"id": a["submission_id"], "worker_id": a["sub_worker"]},
-                a["reward"],
-            )
-        else:
-            con.execute(
-                """UPDATE submissions SET status='rejected', review_reason=?,
-                   reviewed_by=?, reviewed_at=? WHERE id=?""",
-                (reason, actor, now(), a["submission_id"]),
-            )
-        log_action(con, actor, "DECIDE_APPEAL", appeal_id, f"{decision}: {reason}")
-    await update.message.reply_text(f"আপিল #{appeal_id}: {decision}\nকারণ: {reason}")
-
-
-async def refer(update, context):
-    if not await allowed(update):
-        return
-    user = update.effective_user
-    bot_info = await context.bot.get_me()
-    with connect() as con:
-        total = con.execute(
-            "SELECT COUNT(*) n FROM referrals WHERE referrer_id=?", (user.id,)
-        ).fetchone()["n"]
-        paid = con.execute(
-            "SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND bonus_paid=1",
-            (user.id,),
-        ).fetchone()["n"]
-        earned = con.execute(
-            "SELECT COALESCE(SUM(bonus_amount),0) n FROM referrals WHERE referrer_id=?",
-            (user.id,),
-        ).fetchone()["n"]
-    link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
-    await update.message.reply_text(
-        f"🔗 আপনার Referral Link:\n{link}\n\n"
-        f"👥 মোট রেফার: {total}\n✅ বোনাস পাওয়া রেফার: {paid}\n"
-        f"🎁 মোট রেফার বোনাস: ৳{earned:.2f}\n\n"
-        "নিয়ম: আপনার রেফারে আসা সদস্যের প্রথম অনুমোদিত উত্তোলনের "
-        "১০% আপনি একবার পাবেন।"
+    context.user_data.pop("stage", None)
+    context.user_data.pop("proof_job_id", None)
+    audit(uid, "submission_created", f"submission={sub}")
+    await update.message.reply_text(f"✅ সাবমিশন #{sub} জমা হয়েছে।")
+    await safe_send(
+        context, ADMIN_ID,
+        f"📨 Pending submission #{sub}\n"
+        f"Job #{job_id}\nFreelancer: {uid}\nProof:\n{proof[:2500]}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Accept", callback_data=f"sub:accept:{sub}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"sub:reject:{sub}"),
+        ]]),
     )
 
 
-async def withdraw(update, context):
-    if not await allowed(update):
-        return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 2)]
-    if len(parts) != 3:
-        await update.message.reply_text(
-            "ব্যবহার: /withdraw AMOUNT | bKash/Nagad | Account Number"
-        )
-        return
-    try:
-        amount = round(float(parts[0]), 2)
-        if amount <= 0 or amount > 1_000_000:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("টাকার পরিমাণ সঠিক নয়।")
-        return
-    method, account = parts[1], parts[2]
-    user_id = update.effective_user.id
-    with connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        user = con.execute(
-            "SELECT balance FROM users WHERE user_id=?", (user_id,)
-        ).fetchone()
-        if not user or user["balance"] < amount:
-            await update.message.reply_text("আপনার পর্যাপ্ত ব্যালেন্স নেই।")
-            return
-        con.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, user_id))
-        cur = con.execute(
-            """INSERT INTO withdrawals(user_id, amount, method, account, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, amount, method, account, now()),
-        )
-        log_action(con, user_id, "WITHDRAW_REQUEST", cur.lastrowid, f"{amount}; {method}")
-    await update.message.reply_text(
-        f"📤 উত্তোলন আবেদন #{cur.lastrowid} জমা হয়েছে: ৳{amount:.2f}\n"
-        "Admin অনুমোদন না করা পর্যন্ত অপেক্ষা করুন।"
-    )
+async def admin_action(query, context, data):
+    with connect_db() as conn:
+        if data == "admin:deposits":
+            rows = conn.execute(
+                "SELECT * FROM deposits WHERE status='pending' ORDER BY deposit_id LIMIT 20"
+            ).fetchall()
+            for r in rows:
+                await safe_send(
+                    context, ADMIN_ID,
+                    f"Deposit #{r['deposit_id']} User {r['user_id']}\n"
+                    f"{taka(r['amount'])} | {r['method']}\nTxn: {r['transaction_id']}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Approve", callback_data=f"dep:ok:{r['deposit_id']}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"dep:no:{r['deposit_id']}"),
+                    ]]),
+                )
+            if not rows:
+                await query.message.reply_text("Pending deposit নেই।")
 
+        elif data == "admin:withdrawals":
+            rows = conn.execute(
+                "SELECT * FROM withdrawals WHERE status='pending' ORDER BY withdrawal_id LIMIT 20"
+            ).fetchall()
+            for r in rows:
+                await safe_send(
+                    context, ADMIN_ID,
+                    f"Withdrawal #{r['withdrawal_id']} User {r['user_id']}\n"
+                    f"Gross {taka(r['gross'])} | Fee {taka(r['fee'])}\n"
+                    f"Net {taka(r['net'])} | {r['method']} | {r['account']}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Paid", callback_data=f"wd:ok:{r['withdrawal_id']}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"wd:no:{r['withdrawal_id']}"),
+                    ]]),
+                )
+            if not rows:
+                await query.message.reply_text("Pending withdrawal নেই।")
 
-async def mywithdrawals(update, context):
-    if not await allowed(update):
-        return
-    with connect() as con:
-        rows = con.execute(
-            "SELECT * FROM withdrawals WHERE user_id=? ORDER BY id DESC LIMIT 20",
-            (update.effective_user.id,),
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("আপনার কোনো উত্তোলন আবেদন নেই।")
-        return
-    for w in rows:
-        await update.message.reply_text(
-            f"Withdrawal #{w['id']} — ৳{w['amount']:.2f}\n"
-            f"পদ্ধতি: {w['method']}\nStatus: {w['status']}\n"
-            f"কারণ: {w['review_reason'] or 'নেই'}"
-        )
+        elif data == "admin:submissions":
+            rows = conn.execute(
+                "SELECT * FROM submissions WHERE status='pending' ORDER BY submission_id LIMIT 20"
+            ).fetchall()
+            for r in rows:
+                await safe_send(
+                    context, ADMIN_ID,
+                    f"Submission #{r['submission_id']} Job #{r['job_id']}\n"
+                    f"Freelancer {r['freelancer_id']}\nProof: {r['proof'][:2000]}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Accept", callback_data=f"sub:accept:{r['submission_id']}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"sub:reject:{r['submission_id']}"),
+                    ]]),
+                )
+            if not rows:
+                await query.message.reply_text("Pending submission নেই।")
 
-
-async def withdrawals_cmd(update, context):
-    if not await allowed(update):
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("শুধু Admin পারবেন।")
-        return
-    with connect() as con:
-        rows = con.execute(
-            "SELECT * FROM withdrawals WHERE status='pending' ORDER BY id"
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("কোনো Pending withdrawal নেই।")
-        return
-    for w in rows:
-        await update.message.reply_text(
-            f"Withdrawal #{w['id']} | User {w['user_id']}\n"
-            f"Amount: ৳{w['amount']:.2f}\nMethod: {w['method']}\n"
-            f"Account: {w['account']}\n"
-            f"/decidewithdrawal {w['id']} approve | কারণ\n"
-            f"/decidewithdrawal {w['id']} reject | কারণ"
-        )
-
-
-async def decidewithdrawal(update, context):
-    if not await allowed(update):
-        return
-    actor = update.effective_user.id
-    if not is_admin(actor):
-        await update.message.reply_text("শুধু Admin পারবেন।")
-        return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 1)]
-    first = parts[0].split()
-    if len(first) < 2:
-        await update.message.reply_text(
-            "ব্যবহার: /decidewithdrawal ID approve|reject | কারণ"
-        )
-        return
-    try:
-        wid = int(first[0])
-    except ValueError:
-        await update.message.reply_text("Withdrawal ID সঠিক নয়।")
-        return
-    decision = first[1].lower()
-    reason = parts[1] if len(parts) > 1 else "Admin সিদ্ধান্ত"
-    if decision not in ("approve", "reject"):
-        await update.message.reply_text("approve অথবা reject লিখুন।")
-        return
-
-    bonus_info = None
-    with connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        w = con.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
-        if not w or w["status"] != "pending":
-            await update.message.reply_text("আবেদন নেই বা সিদ্ধান্ত দেওয়া হয়েছে।")
-            return
-        con.execute(
-            """UPDATE withdrawals SET status=?, reviewed_by=?, review_reason=?, reviewed_at=?
-               WHERE id=?""",
-            (decision, actor, reason, now(), wid),
-        )
-        if decision == "reject":
-            con.execute(
-                "UPDATE users SET balance=balance+? WHERE user_id=?",
-                (w["amount"], w["user_id"]),
+        elif data == "admin:finance":
+            dep = conn.execute(
+                "SELECT amount FROM deposits WHERE status='approved'"
+            ).fetchall()
+            wd = conn.execute(
+                "SELECT gross, fee, net FROM withdrawals WHERE status='paid'"
+            ).fetchall()
+            await query.message.reply_text(
+                "📊 Finance Summary\n"
+                f"Approved deposits: {taka(sum((Decimal(r['amount']) for r in dep), Decimal('0')))}\n"
+                f"Paid withdrawals: {taka(sum((Decimal(r['gross']) for r in wd), Decimal('0')))}\n"
+                f"Withdrawal fees: {taka(sum((Decimal(r['fee']) for r in wd), Decimal('0')))}"
             )
-        else:
-            bonus_info = pay_referral_bonus_for_first_approved_withdrawal(con, w)
-        log_action(con, actor, "DECIDE_WITHDRAWAL", wid, f"{decision}: {reason}")
-
-    msg = f"Withdrawal #{wid}: {decision}\nকারণ: {reason}"
-    if bonus_info:
-        msg += f"\nরেফারার {bonus_info[0]}-কে ৳{bonus_info[1]:.2f} বোনাস যোগ হয়েছে।"
-    await update.message.reply_text(msg)
 
 
-async def ban_cmd(update, context):
-    if not await allowed(update):
-        return
-    actor = update.effective_user.id
+async def review_record(query, context, kind, decision, record_id):
+    actor = query.from_user.id
     if not is_admin(actor):
-        await update.message.reply_text("শুধু Admin পারবেন।")
         return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 1)]
-    try:
-        target = int(parts[0].split()[0])
-    except (ValueError, IndexError):
-        await update.message.reply_text("ব্যবহার: /ban USER_ID | কারণ")
-        return
-    if target == ADMIN_ID:
-        await update.message.reply_text("নিজের Admin ID Ban করা যাবে না।")
-        return
-    reason = parts[1] if len(parts) > 1 else "কারণ উল্লেখ নেই"
-    with connect() as con:
-        con.execute(
-            """INSERT INTO banned_users(user_id, reason, banned_by, created_at)
-               VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
-               reason=excluded.reason, banned_by=excluded.banned_by,
-               created_at=excluded.created_at""",
-            (target, reason, actor, now()),
+
+    if kind == "dep":
+        with connect_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM deposits WHERE deposit_id=? AND status='pending'",
+                (record_id,),
+            ).fetchone()
+            if not row:
+                await query.message.reply_text("এই ডিপোজিট ইতিমধ্যে পর্যালোচনা হয়েছে।")
+                return
+            if decision == "ok":
+                conn.execute(
+                    "UPDATE deposits SET status='approved', reviewed_at=? WHERE deposit_id=? AND status='pending'",
+                    (now(), record_id),
+                )
+                column = "buyer_balance" if row["balance_type"] == "buyer" else "freelancer_balance"
+                bal = conn.execute(
+                    f"SELECT {column} AS bal FROM users WHERE user_id=?",
+                    (row["user_id"],),
+                ).fetchone()
+                new_bal = amount(Decimal(bal["bal"]) + Decimal(row["amount"]))
+                conn.execute(
+                    f"UPDATE users SET {column}=? WHERE user_id=?",
+                    (str(new_bal), row["user_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE deposits SET status='rejected', reviewed_at=? WHERE deposit_id=? AND status='pending'",
+                    (now(), record_id),
+                )
+        audit(actor, "deposit_review", f"id={record_id},decision={decision}")
+        await safe_send(
+            context, row["user_id"],
+            "✅ ডিপোজিট অনুমোদিত হয়েছে।" if decision == "ok"
+            else "❌ ডিপোজিট প্রত্যাখ্যান করা হয়েছে।"
         )
-        log_action(con, actor, "BAN_USER", target, reason)
-    await update.message.reply_text(f"⛔ User {target} Ban হয়েছে।")
+        await query.message.reply_text("ডিপোজিট পর্যালোচনা সম্পন্ন।")
+        return
 
+    if kind == "wd":
+        with connect_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM withdrawals WHERE withdrawal_id=? AND status='pending'",
+                (record_id,),
+            ).fetchone()
+            if not row:
+                await query.message.reply_text("এই উত্তোলন ইতিমধ্যে পর্যালোচনা হয়েছে।")
+                return
+            if decision == "ok":
+                conn.execute(
+                    "UPDATE withdrawals SET status='paid', reviewed_at=? WHERE withdrawal_id=? AND status='pending'",
+                    (now(), record_id),
+                )
+            else:
+                column = "buyer_balance" if row["balance_type"] == "buyer" else "freelancer_balance"
+                bal = conn.execute(
+                    f"SELECT {column} AS bal FROM users WHERE user_id=?",
+                    (row["user_id"],),
+                ).fetchone()
+                new_bal = amount(Decimal(bal["bal"]) + Decimal(row["gross"]))
+                conn.execute(
+                    f"UPDATE users SET {column}=? WHERE user_id=?",
+                    (str(new_bal), row["user_id"]),
+                )
+                conn.execute(
+                    "UPDATE withdrawals SET status='rejected', reviewed_at=? WHERE withdrawal_id=? AND status='pending'",
+                    (now(), record_id),
+                )
 
-async def unban_cmd(update, context):
-    if not await allowed(update):
-        return
-    actor = update.effective_user.id
-    if not is_admin(actor):
-        await update.message.reply_text("শুধু Admin পারবেন।")
-        return
-    parts = [p.strip() for p in " ".join(context.args).split("|", 1)]
-    try:
-        target = int(parts[0].split()[0])
-    except (ValueError, IndexError):
-        await update.message.reply_text("ব্যবহার: /unban USER_ID | কারণ")
-        return
-    reason = parts[1] if len(parts) > 1 else "কারণ উল্লেখ নেই"
-    with connect() as con:
-        con.execute("DELETE FROM banned_users WHERE user_id=?", (target,))
-        log_action(con, actor, "UNBAN_USER", target, reason)
-    await update.message.reply_text(f"✅ User {target} Unban হয়েছে।")
-
-
-async def audit(update, context):
-    if not await allowed(update):
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("শুধু Admin পারবেন।")
-        return
-    with connect() as con:
-        rows = con.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 15").fetchall()
-    if not rows:
-        await update.message.reply_text("Audit record নেই।")
-        return
-    for r in rows:
-        await update.message.reply_text(
-            f"#{r['id']} {r['created_at']}\nActor: {r['actor_id']}\n"
-            f"{r['action']} | Target: {r['target_id']}\n{r['details']}"
+            # First approved withdrawal earns the referrer's one-time bonus.
+            if decision == "ok":
+                user = conn.execute(
+                    "SELECT referred_by, referral_paid FROM users WHERE user_id=?",
+                    (row["user_id"],),
+                ).fetchone()
+                if user and user["referred_by"] and not user["referral_paid"]:
+                    referrer = conn.execute(
+                        "SELECT user_id, freelancer_balance FROM users WHERE user_id=?",
+                        (user["referred_by"],),
+                    ).fetchone()
+                    if referrer:
+                        bonus = amount(Decimal(row["gross"]) * REFERRAL_RATE)
+                        new_ref_balance = amount(
+                            Decimal(referrer["freelancer_balance"]) + bonus
+                        )
+                        conn.execute(
+                            "UPDATE users SET freelancer_balance=? WHERE user_id=?",
+                            (str(new_ref_balance), user["referred_by"]),
+                        )
+                        conn.execute(
+                            "UPDATE users SET referral_paid=1 WHERE user_id=?",
+                            (row["user_id"],),
+                        )
+                        audit(actor, "referral_bonus",
+                              f"referrer={user['referred_by']},bonus={bonus}")
+        audit(actor, "withdrawal_review", f"id={record_id},decision={decision}")
+        await safe_send(
+            context, row["user_id"],
+            "✅ আপনার পেমেন্ট সম্পন্ন হয়েছে।" if decision == "ok"
+            else f"❌ উত্তোলন প্রত্যাখ্যাত; {taka(row['gross'])} ব্যালেন্সে ফেরত দেওয়া হয়েছে।"
         )
+        await query.message.reply_text("উত্তোলন পর্যালোচনা সম্পন্ন।")
+        return
+
+    if kind == "sub":
+        with connect_db() as conn:
+            row = conn.execute(
+                """SELECT s.*, j.buyer_id, j.price_per_task,
+                          j.reserved_budget, j.task_count, j.status AS job_status
+                   FROM submissions s JOIN jobs j ON j.job_id=s.job_id
+                   WHERE s.submission_id=? AND s.status='pending'""",
+                (record_id,),
+            ).fetchone()
+            if not row:
+                await query.message.reply_text("সাবমিশনটি ইতিমধ্যে পর্যালোচনা হয়েছে।")
+                return
+
+            if decision == "accept":
+                if row["job_status"] != "open" or row["task_count"] <= 0:
+                    await query.message.reply_text("কাজটি আর খোলা নেই।")
+                    return
+                price = amount(row["price_per_task"])
+                reserved = amount(row["reserved_budget"])
+                if reserved < price:
+                    await query.message.reply_text("Escrow বাজেট যথেষ্ট নয়।")
+                    return
+
+                conn.execute(
+                    "UPDATE submissions SET status='accepted', reviewed_at=? WHERE submission_id=? AND status='pending'",
+                    (now(), record_id),
+                )
+                conn.execute(
+                    """UPDATE jobs SET task_count=task_count-1,
+                       reserved_budget=?, status=?
+                       WHERE job_id=?""",
+                    (
+                        str(amount(reserved - price)),
+                        "closed" if row["task_count"] == 1 else "open",
+                        row["job_id"],
+                    ),
+                )
+                f = conn.execute(
+                    "SELECT freelancer_balance FROM users WHERE user_id=?",
+                    (row["freelancer_id"],),
+                ).fetchone()
+                new_bal = amount(Decimal(f["freelancer_balance"]) + price)
+                conn.execute(
+                    "UPDATE users SET freelancer_balance=? WHERE user_id=?",
+                    (str(new_bal), row["freelancer_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE submissions SET status='rejected', reviewed_at=? WHERE submission_id=? AND status='pending'",
+                    (now(), record_id),
+                )
+
+        audit(actor, "submission_review", f"id={record_id},decision={decision}")
+        await safe_send(
+            context, row["freelancer_id"],
+            f"✅ সাবমিশন অনুমোদিত; {taka(row['price_per_task'])} যোগ হয়েছে।"
+            if decision == "accept"
+            else "❌ আপনার সাবমিশন প্রত্যাখ্যান করা হয়েছে।"
+        )
+        await safe_send(
+            context, row["buyer_id"],
+            f"আপনার Job #{row['job_id']} সাবমিশন #{record_id} "
+            f"{'অনুমোদিত' if decision == 'accept' else 'প্রত্যাখ্যাত'} হয়েছে।"
+        )
+        await query.message.reply_text("সাবমিশন পর্যালোচনা সম্পন্ন।")
 
 
-async def admin_cmd(update, context):
-    if not await allowed(update):
-        return
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("আপনি Admin নন।")
-        return
-    with connect() as con:
-        users = con.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-        jobs_count = con.execute("SELECT COUNT(*) n FROM jobs").fetchone()["n"]
-        subs = con.execute(
-            "SELECT COUNT(*) n FROM submissions WHERE status='pending'"
-        ).fetchone()["n"]
-        appeals_count = con.execute(
-            "SELECT COUNT(*) n FROM appeals WHERE status='pending'"
-        ).fetchone()["n"]
-        wds = con.execute(
-            "SELECT COUNT(*) n FROM withdrawals WHERE status='pending'"
-        ).fetchone()["n"]
-        bans = con.execute("SELECT COUNT(*) n FROM banned_users").fetchone()["n"]
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("stage", None)
+    context.user_data.pop("proof_job_id", None)
     await update.message.reply_text(
-        "🛡 BABLU STAR BD Admin Panel\n"
-        f"Users: {users}\nJobs: {jobs_count}\nPending work: {subs}\n"
-        f"Pending appeals: {appeals_count}\nPending withdrawals: {wds}\n"
-        f"Banned users: {bans}\n\n"
-        "/appeals\n/withdrawals\n/audit\n"
-        "/ban USER_ID | কারণ\n/unban USER_ID | কারণ"
+        "চলমান ধাপ বাতিল হয়েছে। /start দিয়ে আবার শুরু করুন।"
     )
 
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("Inject Cloud-এ BOT_TOKEN সেট করুন।")
-    if ADMIN_ID == 0:
-        raise RuntimeError("Inject Cloud-এ ADMIN_ID সঠিকভাবে সেট করুন।")
-
     init_db()
-    app = Application.builder().token(TOKEN).build()
-    handlers = [
-        ("start", start), ("help", help_cmd), ("me", me),
-        ("balance", balance), ("postjob", postjob), ("jobs", jobs),
-        ("submit", submit), ("myjobs", myjobs), ("reviews", reviews),
-        ("review", review), ("appeal", appeal), ("appeals", appeals_cmd),
-        ("decideappeal", decideappeal), ("refer", refer),
-        ("withdraw", withdraw), ("mywithdrawals", mywithdrawals),
-        ("withdrawals", withdrawals_cmd), ("decidewithdrawal", decidewithdrawal),
-        ("ban", ban_cmd), ("unban", unban_cmd), ("audit", audit),
-        ("admin", admin_cmd),
-    ]
-    for command, callback in handlers:
-        app.add_handler(CommandHandler(command, callback))
+    migrate_db()
 
-    print("BABLU STAR BD bot is running...")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text,
+    ))
+    # Proof handler must run before the general text handler.
+    # This group ensures the proof stage is handled first.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_proof,
+    ), group=1)
+
+    logger.info("BABLU STAR BD bot starting...")
     app.run_polling()
 
 
