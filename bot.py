@@ -293,7 +293,20 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): await q.message.reply_text("⛔ শুধু অ্যাডমিন পারবেন।"); return
         parts=d.split(":")
         if d=="adm:home":
-            await q.message.reply_text("👑 Admin Menu",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ লেখা Edit",callback_data="adm:texts")],[InlineKeyboardButton("💰 ফি ও সীমা",callback_data="adm:fees")],[InlineKeyboardButton("💳 পেমেন্ট নম্বর",callback_data="adm:payments")],[InlineKeyboardButton("📊 Pending",callback_data="adm:pending")]])); return
+            await q.message.reply_text("👑 Admin Menu",reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Job Post (ডিপোজিট/ফি ছাড়া)",callback_data="adm:jobpost")],
+                [InlineKeyboardButton("✏️ লেখা Edit",callback_data="adm:texts")],
+                [InlineKeyboardButton("💰 ফি ও সীমা",callback_data="adm:fees")],
+                [InlineKeyboardButton("💳 পেমেন্ট নম্বর",callback_data="adm:payments")],
+                [InlineKeyboardButton("📊 Pending",callback_data="adm:pending")],
+                [InlineKeyboardButton("👥 User List / Ban-Unban",callback_data="adm:users")]
+            ])); return
+        if d=="adm:jobpost":
+            rows=[[InlineKeyboardButton(f"{name} — Admin Job",callback_data=f"cat:{i}")] for i,(name,price) in enumerate(CATS)]
+            await q.message.reply_text(
+                "👑 Admin Job Post\n\nক্যাটাগরি বেছে নিন। এই পথে পোস্ট করা কাজে Buyer Deposit বা ৫% Posting Fee লাগবে না।",
+                reply_markup=InlineKeyboardMarkup(rows)
+            ); return
         if d=="adm:texts": await admin_setting_prompt(q,ctx,"texts"); return
         if d=="adm:fees": await admin_setting_prompt(q,ctx,"fees"); return
         if d=="adm:payments": await admin_setting_prompt(q,ctx,"payments"); return
@@ -450,7 +463,8 @@ async def admin(update,ctx):
         w=c.execute("SELECT COUNT(*) n FROM withdrawals WHERE status='pending'").fetchone()["n"]
         s=c.execute("SELECT COUNT(*) n FROM submissions WHERE status='pending'").fetchone()["n"]
         users=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-    rows=[[InlineKeyboardButton("✏️ লেখা/মেসেজ Edit",callback_data="adm:texts")],
+    rows=[[InlineKeyboardButton("👑 Admin Job Post (ডিপোজিট/ফি ছাড়া)",callback_data="adm:jobpost")],
+          [InlineKeyboardButton("✏️ লেখা/মেসেজ Edit",callback_data="adm:texts")],
           [InlineKeyboardButton("💰 ফি ও সীমা Edit",callback_data="adm:fees")],
           [InlineKeyboardButton("💳 পেমেন্ট নম্বর Edit",callback_data="adm:payments")],
           [InlineKeyboardButton("📊 Pending তালিকা",callback_data="adm:pending")],
