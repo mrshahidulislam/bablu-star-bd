@@ -53,14 +53,19 @@ def init():
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,actor INTEGER,action TEXT,details TEXT,created TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         """)
+        # Safe additive migrations for existing installations.
+        cols={r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
+        if "ban_reason" not in cols: c.execute("ALTER TABLE users ADD COLUMN ban_reason TEXT DEFAULT ''")
+        if "is_admin_job" not in {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}:
+            c.execute("ALTER TABLE jobs ADD COLUMN is_admin_job INTEGER DEFAULT 0")
 DEFAULT_TEXTS = {
     "welcome": "🌟 BABLU STAR BD-তে স্বাগতম! 🌟\n\n💼 আপনার কাজ, আপনার উপার্জন!\n🛒 Buyer Mode — নিজের কাজ পোস্ট করুন\n🧑‍💻 Freelancer Mode — কাজ করুন ও আয় করুন\n\n👇 শুরু করতে নিচের একটি মোড বেছে নিন।",
     "support_email": "mrshahidulislam8989@gmail.com",
     "rules": "• কাজের দাম ক্যাটাগরি মিনিমামের কম নয়।\n• ভুয়া অ্যাকাউন্ট, প্রতারণা, স্প্যাম বা প্ল্যাটফর্মের নিয়মভঙ্গকারী কাজ নিষিদ্ধ।\n• বাজেট আগে বায়ার ব্যালেন্স থেকে সংরক্ষিত হবে।\n• প্রুফ অ্যাডমিন অনুমোদন করলে ফ্রিল্যান্সার টাকা পাবেন।\n• ডিপোজিট/উইথড্র ম্যানুয়ালি যাচাই হয়।",
     "payment_info": "bKash/Nagad ডিপোজিট Txn ID দিয়ে জমা দিন। অ্যাডমিন যাচাইয়ের পর ব্যালেন্স যোগ হবে।",
     "banned_text": "⛔ আপনার অ্যাকাউন্ট সীমাবদ্ধ করা হয়েছে। কারণ: {reason}",
-    "deposit_min": "50", "withdraw_min": "100", "recharge_min": "50",
-    "withdraw_fee": "15", "post_fee": "5", "referral_bonus": "10", "usd_rate": "100",
+    "deposit_min": "50", "withdraw_min_usd": "1", "recharge_min_usd": "0.50", "withdraw_min": "1", "recharge_min": "0.50",
+    "withdraw_fee": "15", "recharge_fee": "15", "post_fee": "5", "referral_bonus": "10", "usd_rate": "100",
     "bkash_number": "পরিবর্তন করা হয়নি", "nagad_number": "পরিবর্তন করা হয়নি",
     "support_url": "https://t.me/"
 }
@@ -92,6 +97,9 @@ async def admin_msg(ctx,text,kind=None,item=None):
     except Exception: log.exception("admin notification failed")
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     u=update.effective_user; user_row(u)
+    with conn() as c: br=c.execute("SELECT banned,ban_reason FROM users WHERE id=?",(u.id,)).fetchone()
+    if br and br["banned"] and not is_admin(u.id):
+        await update.effective_message.reply_text(get_setting("banned_text").format(reason=br["ban_reason"] or "অ্যাডমিনের সিদ্ধান্ত"),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆘 Support",url=get_setting("support_url"))]])); return
     if ctx.args and ctx.args[0].startswith("ref_"):
         try:
             ref=int(ctx.args[0][4:])
@@ -112,9 +120,25 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     with conn() as c:
         r=c.execute("SELECT banned FROM users WHERE id=?",(u.id,)).fetchone()
     if r and r["banned"]:
-        await update.effective_message.reply_text("আপনার অ্যাকাউন্ট বন্ধ আছে। অ্যাডমিনের সঙ্গে যোগাযোগ করুন।"); return
+        with conn() as c: br=c.execute("SELECT ban_reason FROM users WHERE id=?",(u.id,)).fetchone()
+        await update.effective_message.reply_text(get_setting("banned_text").format(reason=(br["ban_reason"] if br else "") or "অ্যাডমিনের সিদ্ধান্ত"),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆘 Support",url=get_setting("support_url"))]])); return
     if t in ("🔙 Back / ❌ Cancel","🔙 Back","❌ Cancel","/cancel"):
         await menu(update,ctx,"চলমান কাজ বাতিল হয়েছে।"); return
+    if is_admin(u.id) and ctx.user_data.pop("admin_user_search",False):
+        term=t.lstrip("@").strip()
+        with conn() as c:
+            if term.isdigit(): rs=c.execute("SELECT id,username,first_name,banned FROM users WHERE id=?",(int(term),)).fetchall()
+            else: rs=c.execute("SELECT id,username,first_name,banned FROM users WHERE username LIKE ? ORDER BY id DESC LIMIT 20",("%"+term+"%",)).fetchall()
+        if not rs: await update.effective_message.reply_text("কোনো ইউজার পাওয়া যায়নি।"); return
+        rows=[[InlineKeyboardButton(f"{r['id']} | @{r['username'] or '—'} | {'BANNED' if r['banned'] else 'ACTIVE'}",callback_data=f"adm:user:{r['id']}")] for r in rs]
+        await update.effective_message.reply_text("🔎 Search Results:",reply_markup=InlineKeyboardMarkup(rows)); return
+    if is_admin(u.id) and ctx.user_data.get("ban_target"):
+        target=ctx.user_data.pop("ban_target")
+        with conn() as c: c.execute("UPDATE users SET banned=1,ban_reason=? WHERE id=?",(t[:500],target))
+        await update.effective_message.reply_text(f"🚫 User {target} Ban করা হয়েছে। কারণ: {t[:500]}")
+        try: await ctx.bot.send_message(target,"⛔ আপনার অ্যাকাউন্ট সীমাবদ্ধ করা হয়েছে।\nকারণ: "+t[:500],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆘 Support",url=get_setting("support_url"))]]))
+        except Exception: pass
+        return
     if is_admin(u.id) and ctx.user_data.get("admin_edit_key"):
         key=ctx.user_data.pop("admin_edit_key")
         if len(t)>4000: await update.effective_message.reply_text("সর্বোচ্চ ৪০০০ অক্ষর দিন।"); ctx.user_data["admin_edit_key"]=key; return
@@ -139,7 +163,7 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif t=="💰 বায়ার ব্যালেন্স" and mode=="buyer": await balance(update,u.id,"buyer")
     elif t=="💰 ফ্রিল্যান্সার ব্যালেন্স" and mode=="worker": await balance(update,u.id,"worker")
     elif t=="➕ ডিপোজিট" and mode=="buyer":
-        ctx.user_data["stage"]="dep_amount"; await update.effective_message.reply_text("ডিপোজিটের পরিমাণ লিখুন (সর্বনিম্ন ৳১০)।")
+        ctx.user_data["stage"]="dep_amount"; await update.effective_message.reply_text(f"💳 ডিপোজিটের পরিমাণ লিখুন (সর্বনিম্ন ৳{get_setting('deposit_min')})।")
     elif t=="🔎 কাজ দেখুন" and mode=="worker":
         with conn() as c: rs=c.execute("SELECT * FROM jobs WHERE status='open' AND count>0 ORDER BY id DESC LIMIT 10").fetchall()
         if not rs: await update.effective_message.reply_text("এখন কোনো খোলা কাজ নেই।")
@@ -194,18 +218,17 @@ async def stage_input(update,ctx,st,t):
         f=ctx.user_data["form"]; f["rules"]=t; total=Decimal(f["price"])*f["count"]
         with conn() as c: r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone()
         bal=Decimal(r["buyer"] or 0)
-        if bal<total:
+        if not is_admin(uid) and bal<total:
             await msg.reply_text(f"ব্যালেন্স কম। মোট বাজেট ৳{m(total)}, বর্তমান ৳{m(bal)}। আগে ডিপোজিট করুন।"); ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); return
         ctx.user_data["stage"]="job_confirm"
         await msg.reply_text(f"প্ল্যাটফর্ম: {CATS[f['cat']][0]}\nশিরোনাম: {f['title']}\nবিবরণ: {f['desc']}\nকাজ: {f['count']}\nপ্রতি কাজ: ৳{m(f['price'])}\nমোট বাজেট: ৳{m(total)}\nনিয়ম: {t}\nপোস্ট করবেন?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ পোস্ট",callback_data="job:yes"),InlineKeyboardButton("❌ বাতিল",callback_data="job:no")]]))
     elif st=="dep_amount":
         a=amount(t)
-        if a is None or a<10: await msg.reply_text("সর্বনিম্ন ৳১০ লিখুন।"); return
+        if a is None or a<Decimal(get_setting("deposit_min")): await msg.reply_text(f"সর্বনিম্ন ৳{get_setting('deposit_min')} লিখুন।"); return
         ctx.user_data["form"]={"amount":str(a)}; ctx.user_data["stage"]="dep_method"
-        await msg.reply_text("bKash অথবা Nagad লিখুন।")
+        await msg.reply_text("পেমেন্ট পদ্ধতি নির্বাচন করুন:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📲 bKash",callback_data="dep_method:bkash"),InlineKeyboardButton("💚 Nagad",callback_data="dep_method:nagad")]]))
     elif st=="dep_method":
-        if t not in ("bKash","Nagad"): await msg.reply_text("bKash অথবা Nagad লিখুন।"); return
-        ctx.user_data["form"]["method"]=t; ctx.user_data["stage"]="dep_txn"; await msg.reply_text("Transaction ID লিখুন।")
+        await msg.reply_text("উপরের bKash অথবা Nagad বাটন নির্বাচন করুন।")
     elif st=="dep_txn":
         f=ctx.user_data["form"]
         try:
@@ -215,16 +238,21 @@ async def stage_input(update,ctx,st,t):
         await msg.reply_text("আপনার পেমেন্ট রিকুয়েস্ট সফলভাবে জমা হয়েছে। অনুগ্রহ করে অপেক্ষা করুন। আপনার পেমেন্ট রিকুয়েস্ট জমা দেওয়ার সময় থেকে সর্বোচ্চ ৪৮ ঘণ্টার মধ্যে পেমেন্ট সম্পন্ন করা হবে। ধৈর্য ধরে অপেক্ষা করার জন্য আপনাকে ধন্যবাদ। — BABLU STAR BD")
         await admin_msg(ctx,f"Deposit #{did}\nUser: {uid}\nAmount: ৳{f['amount']}\nMethod: {f['method']}\nTxn: {t}","deposit",did)
     elif st=="wd_gross":
-        g=amount(t)
-        if g is None or g<10: await msg.reply_text("সর্বনিম্ন উইথড্র ৳১০।"); return
-        fee=(g*FEE).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP); net=g-fee
+        usd=amount(t); method=ctx.user_data.get("wd_method","bkash")
+        minimum=Decimal(get_setting("recharge_min_usd") if method=="recharge" else get_setting("withdraw_min_usd"))
+        if usd is None or usd<minimum:
+            await msg.reply_text(f"সর্বনিম্ন পরিমাণ ${m(minimum)}। আবার লিখুন:"); return
+        rate=Decimal(get_setting("usd_rate") or "100")
+        gross=(usd*rate).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+        fee_pct=Decimal(get_setting("recharge_fee" if method=="recharge" else "withdraw_fee") or "15")
+        fee=(gross*fee_pct/Decimal("100")).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP); net=gross-fee
         with conn() as c: r=c.execute("SELECT worker FROM users WHERE id=?",(uid,)).fetchone()
-        if Decimal(r["worker"] or 0)<g: await msg.reply_text(f"ব্যালেন্স কম। আপনার ব্যালেন্স ৳{m(r['worker'])}।"); return
-        ctx.user_data["form"]={"gross":str(g),"fee":str(fee),"net":str(net)}; ctx.user_data["stage"]="wd_method"
-        await msg.reply_text(f"মোট ৳{m(g)} | ১৫% ফি ৳{m(fee)} | পাবেন ৳{m(net)}\nbKash, Nagad অথবা Recharge লিখুন।")
-    elif st=="wd_method":
-        if t not in ("bKash","Nagad","Recharge"): await msg.reply_text("bKash, Nagad অথবা Recharge লিখুন।"); return
-        ctx.user_data["form"]["method"]=t; ctx.user_data["stage"]="wd_account"; await msg.reply_text("মোবাইল/অ্যাকাউন্ট নম্বর লিখুন।")
+        if Decimal(r["worker"] or 0)<gross:
+            await msg.reply_text(f"ব্যালেন্স কম। প্রয়োজন ৳{m(gross)}, আপনার ব্যালেন্স ৳{m(r['worker'] or 0)}।"); return
+        ctx.user_data["form"]={"usd":str(usd),"gross":str(gross),"fee":str(fee),"net":str(net),"method":method}
+        ctx.user_data["stage"]="wd_account"
+        label={"bkash":"bKash নম্বর","nagad":"Nagad নম্বর","recharge":"যে মোবাইল নম্বরে রিচার্জ চান"}[method]
+        await msg.reply_text(f"🧾 আপনার হিসাব\nপরিমাণ: ${m(usd)} = ৳{m(gross)}\nফি ({m(fee_pct)}%): ৳{m(fee)}\n✅ আপনি পাবেন: ৳{m(net)}\n\nএখন {label} লিখুন।")
     elif st=="wd_account":
         if len(t)<8 or len(t)>40: await msg.reply_text("সঠিক নম্বর লিখুন।"); return
         f=ctx.user_data["form"]; g=Decimal(f["gross"])
@@ -279,10 +307,56 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             lines += [f"Withdraw #{r['id']} | User {r['user_id']} | ৳{r['gross']} {r['method']}" for r in ws]
             lines += [f"Submission #{r['id']} | Job {r['job_id']} | Worker {r['worker_id']}" for r in ss]
             await q.message.reply_text("\n".join(lines)); return
+        if d=="adm:users":
+            with conn() as c:
+                total=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+                rs=c.execute("SELECT id,username,first_name,banned FROM users ORDER BY created DESC LIMIT 20").fetchall()
+            rows=[]
+            for r in rs:
+                state="🚫 BANNED" if r["banned"] else "🟢 ACTIVE"
+                uname=("@"+r["username"]) if r["username"] else "(no username)"
+                rows.append([InlineKeyboardButton(f"{r['id']} | {uname} | {state}",callback_data=f"adm:user:{r['id']}")])
+            rows.append([InlineKeyboardButton("🔎 Search User ID / Username",callback_data="adm:usersearch")])
+            rows.append([InlineKeyboardButton("🔄 Refresh",callback_data="adm:users"),InlineKeyboardButton("⬅️ Admin Menu",callback_data="adm:home")])
+            await q.message.reply_text(f"👥 User Management\nমোট নিবন্ধিত Telegram account: {total}\nসর্বশেষ ২০ জন দেখানো হচ্ছে।\n\nপ্রতিটি ইউজার খুলতে চাপুন:",reply_markup=InlineKeyboardMarkup(rows)); return
+        if d=="adm:usersearch":
+            ctx.user_data["admin_user_search"]=True
+            await q.message.reply_text("Telegram User ID অথবা Username লিখুন:")
+            return
+        if len(parts)==3 and parts[1]=="user":
+            target=int(parts[2])
+            with conn() as c: r=c.execute("SELECT * FROM users WHERE id=?",(target,)).fetchone()
+            if not r: await q.message.reply_text("ইউজার পাওয়া যায়নি।"); return
+            status="🚫 Banned" if r["banned"] else "🟢 Active"
+            uname="@"+(r["username"] or " নেই")
+            action="unban" if r["banned"] else "ban"
+            await q.message.reply_text(f"👤 User Details\nID: {r['id']}\nUsername: {uname}\nName: {r['first_name']}\nStatus: {status}\nBan reason: {r['ban_reason'] or '—'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔓 Unban" if action=="unban" else "🚫 Ban",callback_data=f"adm:{action}:{target}")],[InlineKeyboardButton("⬅️ User List",callback_data="adm:users")]])); return
+        if len(parts)==3 and parts[1] in ("ban","unban"):
+            target=int(parts[2])
+            if parts[1]=="ban":
+                ctx.user_data["ban_target"]=target
+                await q.message.reply_text("Ban করার কারণ লিখুন:"); return
+            with conn() as c: c.execute("UPDATE users SET banned=0,ban_reason='' WHERE id=?",(target,))
+            await q.message.reply_text(f"✅ User {target} Unban করা হয়েছে।"); return
         if len(parts)==3 and parts[1]=="edit":
             key=parts[2]; ctx.user_data["admin_edit_key"]=key
             await q.message.reply_text(f"✏️ নতুন মান/লেখা পাঠান।\n\nবর্তমান মান:\n{get_setting(key)}\n\nবাতিল করতে /cancel লিখুন।")
             return
+    if d.startswith("dep_method:"):
+        method=d.split(":",1)[1]
+        if method not in ("bkash","nagad"): return
+        ctx.user_data["form"]["method"]=method; ctx.user_data["stage"]="dep_txn"
+        number=get_setting("bkash_number" if method=="bkash" else "nagad_number")
+        await q.message.reply_text(f"💳 {method.upper()} পেমেন্ট\nপরিমাণ: ৳{m(ctx.user_data['form']['amount'])}\nপেমেন্ট পাঠানোর নম্বর: {number}\n\nপেমেন্ট করার পর Transaction ID লিখুন:")
+        return
+    if d.startswith("wdmethod:"):
+        method=d.split(":",1)[1]
+        if method not in ("bkash","nagad","recharge"): return
+        ctx.user_data["wd_method"]=method; ctx.user_data["stage"]="wd_gross"
+        minimum=get_setting("recharge_min_usd") if method=="recharge" else get_setting("withdraw_min_usd")
+        fee=get_setting("recharge_fee") if method=="recharge" else get_setting("withdraw_fee")
+        await q.message.reply_text(f"পদ্ধতি: {method.upper()}\nসর্বনিম্ন: ${minimum}\nফি: {fee}%\nকত USD তুলবেন/রিচার্জ করবেন? পরিমাণ লিখুন:")
+        return
     if d.startswith("cat:"):
         try: ci=int(d.split(":")[1]); name,mi=CATS[ci]
         except: return
@@ -295,12 +369,15 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         f=ctx.user_data["form"]; total=Decimal(f["price"])*int(f["count"])
         with conn() as c:
             c.execute("BEGIN IMMEDIATE"); r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone(); bal=Decimal(r["buyer"] or 0)
-            if bal<total: c.rollback(); await q.message.reply_text("বায়ার ব্যালেন্স কম।"); return
-            c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-total),uid))
-            cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,status,created) VALUES(?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],"open",now())); jid=cur.lastrowid
-            c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-total),"escrow",f"Job #{jid}",now()))
+            admin_job=is_admin(uid)
+            if not admin_job and bal<total: c.rollback(); await q.message.reply_text("বায়ার ব্যালেন্স কম। আগে ডিপোজিট করুন।"); return
+            if not admin_job:
+                c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-total),uid))
+            cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,status,created,is_admin_job) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],"open",now(),1 if admin_job else 0)); jid=cur.lastrowid
+            if not admin_job:
+                c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-total),"escrow",f"Job #{jid}",now()))
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
-        await q.message.reply_text(f"কাজ #{jid} পোস্ট হয়েছে। মোট বাজেট ৳{m(total)}")
+        await q.message.reply_text(f"কাজ #{jid} পোস্ট হয়েছে। মোট বাজেট ৳{m(total)}\n"+("👑 Admin Job: ডিপোজিট ও পোস্টিং ফি লাগেনি।" if is_admin(uid) else "বাজেট আপনার Buyer Balance থেকে সংরক্ষিত হয়েছে।"))
         await admin_msg(ctx,f"New job #{jid}: {f['title']} | buyer {uid} | budget ৳{m(total)}")
     elif d.startswith("submit:"):
         jid=int(d.split(":")[1])
@@ -372,10 +449,12 @@ async def admin(update,ctx):
         d=c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"]
         w=c.execute("SELECT COUNT(*) n FROM withdrawals WHERE status='pending'").fetchone()["n"]
         s=c.execute("SELECT COUNT(*) n FROM submissions WHERE status='pending'").fetchone()["n"]
+        users=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
     rows=[[InlineKeyboardButton("✏️ লেখা/মেসেজ Edit",callback_data="adm:texts")],
           [InlineKeyboardButton("💰 ফি ও সীমা Edit",callback_data="adm:fees")],
           [InlineKeyboardButton("💳 পেমেন্ট নম্বর Edit",callback_data="adm:payments")],
-          [InlineKeyboardButton("📊 Pending তালিকা",callback_data="adm:pending")]]
+          [InlineKeyboardButton("📊 Pending তালিকা",callback_data="adm:pending")],
+          [InlineKeyboardButton("👥 User List / Ban-Unban",callback_data="adm:users")]]
     await update.effective_message.reply_text(f"👑 BABLU STAR BD — Admin Dashboard\n\n📥 Pending Deposit: {d}\n📤 Pending Withdrawal: {w}\n🧾 Pending Submission: {s}\n\nনিচের বাটন থেকে সেটিংস পরিবর্তন করুন।",reply_markup=InlineKeyboardMarkup(rows))
 
 async def admin_setting_prompt(q,ctx,group):
