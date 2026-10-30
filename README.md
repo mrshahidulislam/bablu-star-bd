@@ -1,19 +1,21 @@
-BABLU STAR BD — corrected starter package
+BABLU STAR BD — Professional Baseline
 
-Files:
-- bot.py: Telegram bot source
-- requirements.txt: dependencies
+এই সংস্করণে পুরোনো ৩০টি জেনেরিক ক্যাটাগরি বাদ দিয়ে শুধুমাত্র ৮টি প্ল্যাটফর্ম রাখা হয়েছে:
+1. Facebook
+2. YouTube
+3. Instagram
+4. TikTok
+5. X (Twitter)
+6. Snapchat
+7. Telegram
+8. LinkedIn
 
-Python: 3.10+
-Install: pip install -r requirements.txt
-Required environment variables:
-  BOT_TOKEN = token from @BotFather
-  ADMIN_ID = your numeric Telegram user ID
-Optional:
-  DB_PATH = bablu_star_bd.sqlite3
-Run: python bot.py
+ইনস্টল:
+1) আগের bot.py এবং SQLite database-এর ব্যাকআপ নিন।
+2) bot_professional.py-কে আপনার সার্ভারের bot.py নামে রাখুন অথবা চালানোর কমান্ডে এই ফাইল ব্যবহার করুন।
+3) requirements_professional.txt ইনস্টল করুন।
+4) BOT_TOKEN এবং ADMIN_ID environment variables সেট করুন।
+5) Persistent storage-এ DB_PATH সেট করুন।
 
-IMPORTANT:
-- This code has passed Python syntax compilation, but has NOT been tested against your live Telegram bot or Inject Cloud account.
-- Set the correct admin ID and token privately in the hosting environment; never share BOT_TOKEN publicly.
-- Deposit approvals and withdrawals are manual admin workflows. Test with small amounts / a test bot before real money.
+সতর্কতা: এটি Professional Baseline; Telegram/Inject Cloud-এ লাইভ টেস্ট করা হয়নি।
+এই সংস্করণে ৮টি প্ল্যাটফর্মের বাছাই আছে, কিন্তু প্রতিটি প্ল্যাটফর্মের আলাদা Like/Follow/Comment এবং ৩-কাজের bundle payout workflow এখনও সম্পূর্ণ বাস্তবায়িত নয়।
