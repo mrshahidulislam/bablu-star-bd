@@ -1,4 +1,5 @@
 import os, sqlite3, logging
+from pathlib import Path
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -6,7 +7,30 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN = int(os.getenv("ADMIN_ID", "0") or "0")
-DB = os.getenv("DB_PATH", "bablu_star_bd.sqlite3")
+# Inject Cloud persistent SQLite storage.
+# If DB_PATH is explicitly configured, use it; otherwise use ./data/.
+_db_env = os.getenv("DB_PATH", "").strip()
+DB = str(Path(_db_env).expanduser()) if _db_env else str(Path("data") / "bablu_star_bd.sqlite3")
+Path(DB).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
+# One-time safe migration from the old project-root DB to persistent data/.
+# SQLite backup() includes committed WAL data; never use shutil.copy on a live DB.
+if not _db_env:
+    _legacy_db = Path("bablu_star_bd.sqlite3")
+    _persistent_db = Path(DB)
+    if _legacy_db.is_file() and not _persistent_db.exists():
+        _src = sqlite3.connect(str(_legacy_db), timeout=30)
+        try:
+            _dst = sqlite3.connect(str(_persistent_db), timeout=30)
+            try:
+                _src.backup(_dst)
+            finally:
+                _dst.close()
+        finally:
+            _src.close()
+        logging.getLogger("bablu-star-bd").warning(
+            "Migrated legacy SQLite database to persistent path: %s", DB
+        )
 FEE = Decimal("0.15")
 REFERRAL = Decimal("0.10")
 logging.basicConfig(level=logging.INFO)
