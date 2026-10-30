@@ -55,9 +55,11 @@ def init():
         """)
         # Safe additive migrations for existing installations.
         cols={r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
-        if "ban_reason" not in cols: c.execute("ALTER TABLE users ADD COLUMN ban_reason TEXT DEFAULT ''")
-        if "is_admin_job" not in {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}:
-            c.execute("ALTER TABLE jobs ADD COLUMN is_admin_job INTEGER DEFAULT 0")
+        # Additive-only migrations: existing rows and transaction history remain intact.
+        for col, decl in (("ban_reason", "TEXT DEFAULT ''"), ("buyer", "TEXT DEFAULT '0'"), ("worker", "TEXT DEFAULT '0'"), ("device_info", "TEXT DEFAULT ''")):
+            if col not in cols: c.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+        jcols={r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "is_admin_job" not in jcols: c.execute("ALTER TABLE jobs ADD COLUMN is_admin_job INTEGER DEFAULT 0")
 DEFAULT_TEXTS = {
     "welcome": "🌟 BABLU STAR BD-তে স্বাগতম! 🌟\n\n💼 আপনার কাজ, আপনার উপার্জন!\n🛒 Buyer Mode — নিজের কাজ পোস্ট করুন\n🧑‍💻 Freelancer Mode — কাজ করুন ও আয় করুন\n\n👇 শুরু করতে নিচের একটি মোড বেছে নিন।",
     "support_email": "mrshahidulislam8989@gmail.com",
@@ -324,11 +326,17 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                 ds=c.execute("SELECT id,user_id,amount,method FROM deposits WHERE status='pending' ORDER BY id DESC LIMIT 10").fetchall()
                 ws=c.execute("SELECT id,user_id,gross,method FROM withdrawals WHERE status='pending' ORDER BY id DESC LIMIT 10").fetchall()
                 ss=c.execute("SELECT id,job_id,worker_id FROM submissions WHERE status='pending' ORDER BY id DESC LIMIT 10").fetchall()
+                js=c.execute("SELECT id,title,buyer_id FROM jobs WHERE status='pending_admin' ORDER BY id DESC LIMIT 10").fetchall()
             lines=["📋 Pending Queue"]
             lines += [f"Deposit #{r['id']} | User {r['user_id']} | ৳{r['amount']} {r['method']}" for r in ds]
             lines += [f"Withdraw #{r['id']} | User {r['user_id']} | ৳{r['gross']} {r['method']}" for r in ws]
             lines += [f"Submission #{r['id']} | Job {r['job_id']} | Worker {r['worker_id']}" for r in ss]
+            lines += [f"Job Approval #{r['id']} | Buyer {r['buyer_id']} | {r['title']}" for r in js]
             rows=[]
+            for r in ds:
+                rows.append([InlineKeyboardButton(f"✅ Approve Deposit #{r['id']}",callback_data=f"review:deposit:yes:{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:deposit:no:{r['id']}")])
+            for r in js:
+                rows.append([InlineKeyboardButton(f"✅ Publish Job #{r['id']}",callback_data=f"review:job:yes:{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:job:no:{r['id']}")])
             for r in ws:
                 rows.append([InlineKeyboardButton(f"✅ Approve Withdraw #{r['id']}",callback_data=f"review:withdraw:yes:{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:withdraw:no:{r['id']}")])
             rows.append([InlineKeyboardButton("⬅️ Admin Menu",callback_data="adm:home")])
@@ -400,12 +408,12 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             if not admin_job and bal<total: c.rollback(); await q.message.reply_text("বায়ার ব্যালেন্স কম। আগে ডিপোজিট করুন।"); return
             if not admin_job:
                 c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-total),uid))
-            cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,status,created,is_admin_job) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],"open",now(),1 if admin_job else 0)); jid=cur.lastrowid
+            cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,status,created,is_admin_job) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],"open" if admin_job else "pending_admin",now(),1 if admin_job else 0)); jid=cur.lastrowid
             if not admin_job:
                 c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-total),"escrow",f"Job #{jid}",now()))
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
-        await q.message.reply_text(f"কাজ #{jid} পোস্ট হয়েছে। মোট বাজেট ৳{m(total)}\n"+("👑 Admin Job: ডিপোজিট ও পোস্টিং ফি লাগেনি।" if is_admin(uid) else "বাজেট আপনার Buyer Balance থেকে সংরক্ষিত হয়েছে।"))
-        await admin_msg(ctx,f"New job #{jid}: {f['title']} | buyer {uid} | budget ৳{m(total)}")
+        await q.message.reply_text(f"কাজ #{jid} জমা হয়েছে। মোট বাজেট ৳{m(total)}\n"+("👑 Admin Job: সরাসরি প্রকাশিত হয়েছে; ডিপোজিট/পোস্টিং ফি লাগেনি।" if is_admin(uid) else "বাজেট সংরক্ষিত হয়েছে। অ্যাডমিন অনুমোদনের পর কাজটি ফ্রিল্যান্সারদের দেখানো হবে।"))
+        if not is_admin(uid): await admin_msg(ctx,f"নতুন Job Approval দরকার\nJob #{jid}: {f['title']} | Buyer {uid} | Budget ৳{m(total)}", "job", jid)
     elif d.startswith("submit:"):
         jid=int(d.split(":")[1])
         with conn() as c:
@@ -423,7 +431,21 @@ async def review(q,ctx,kind,item,yes):
     target=0; usermsg=""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        if kind=="deposit":
+        if kind=="job":
+            r=c.execute("SELECT * FROM jobs WHERE id=?",(item,)).fetchone()
+            if not r or r["status"]!="pending_admin": await q.message.reply_text("কাজটি আর Pending নেই।"); return
+            if yes:
+                c.execute("UPDATE jobs SET status='open' WHERE id=? AND status='pending_admin'",(item,))
+                target=r["buyer_id"]; usermsg=f"আপনার Job #{item} অ্যাডমিন অনুমোদন করেছেন। এখন ফ্রিল্যান্সাররা কাজটি দেখতে পারবেন।"
+            else:
+                c.execute("UPDATE jobs SET status='rejected',reserved='0' WHERE id=? AND status='pending_admin'",(item,))
+                if not r["is_admin_job"]:
+                    u=c.execute("SELECT buyer FROM users WHERE id=?",(r["buyer_id"],)).fetchone()
+                    refund=Decimal(r["reserved"] or "0")
+                    c.execute("UPDATE users SET buyer=? WHERE id=?",(str(Decimal(u["buyer"] or "0")+refund),r["buyer_id"]))
+                    c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(r["buyer_id"],"buyer",str(refund),"job_refund",f"Rejected Job #{item}",now()))
+                target=r["buyer_id"]; usermsg=f"আপনার Job #{item} বাতিল হয়েছে। সংরক্ষিত বাজেট ফেরত দেওয়া হয়েছে।"
+        elif kind=="deposit":
             r=c.execute("SELECT * FROM deposits WHERE id=?",(item,)).fetchone()
             if not r or r["status"]!="pending": await q.message.reply_text("ইতিমধ্যে প্রসেস করা হয়েছে।"); return
             c.execute("UPDATE deposits SET status=?,reviewed=? WHERE id=? AND status='pending'",("approved" if yes else "rejected",now(),item))
