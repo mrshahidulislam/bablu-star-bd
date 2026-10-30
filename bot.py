@@ -175,7 +175,18 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         with conn() as c: rs=c.execute("SELECT s.id,s.job_id,s.status,j.title FROM submissions s JOIN jobs j ON j.id=s.job_id WHERE s.worker_id=? ORDER BY s.id DESC LIMIT 20",(u.id,)).fetchall()
         await update.effective_message.reply_text("\n".join([f"#{r['id']} কাজ #{r['job_id']} {r['title']} — {r['status']}" for r in rs]) or "কোনো সাবমিশন নেই।")
     elif t=="💸 উইথড্র" and mode=="worker":
-        ctx.user_data["stage"]="wd_gross"; await update.effective_message.reply_text("কত টাকা তুলবেন? ১৫% ফি কাটা হবে। যেমন 100।")
+        ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
+        await update.effective_message.reply_text(
+            "💸 উইথড্র / পেমেন্ট পদ্ধতি বেছে নিন:\n\n"
+            "১) বিকাশ — সর্বনিম্ন ৳১০০, ফি ১৫%\n"
+            "২) নগদ — সর্বনিম্ন ৳১০০, ফি ১৫%\n"
+            "৩) মোবাইল রিচার্জ — সর্বনিম্ন ৳৫০, ফি ১৫%",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 বিকাশ — মিনিমাম ৳১০০",callback_data="wdmethod:bkash")],
+                [InlineKeyboardButton("💚 নগদ — মিনিমাম ৳১০০",callback_data="wdmethod:nagad")],
+                [InlineKeyboardButton("📞 মোবাইল রিচার্জ — মিনিমাম ৳৫০",callback_data="wdmethod:recharge")]
+            ])
+        )
     elif t=="👥 রেফার লিংক" and mode=="worker":
         me=await ctx.bot.get_me(); await update.effective_message.reply_text(f"https://t.me/{me.username}?start=ref_{u.id}\nরেফার করা ব্যক্তির প্রথম অনুমোদিত উইথড্রয়ের মোট অঙ্কের ১০% একবার বোনাস।")
     elif t=="💳 পেমেন্ট তথ্য":
@@ -238,21 +249,19 @@ async def stage_input(update,ctx,st,t):
         await msg.reply_text("আপনার পেমেন্ট রিকুয়েস্ট সফলভাবে জমা হয়েছে। অনুগ্রহ করে অপেক্ষা করুন। আপনার পেমেন্ট রিকুয়েস্ট জমা দেওয়ার সময় থেকে সর্বোচ্চ ৪৮ ঘণ্টার মধ্যে পেমেন্ট সম্পন্ন করা হবে। ধৈর্য ধরে অপেক্ষা করার জন্য আপনাকে ধন্যবাদ। — BABLU STAR BD")
         await admin_msg(ctx,f"Deposit #{did}\nUser: {uid}\nAmount: ৳{f['amount']}\nMethod: {f['method']}\nTxn: {t}","deposit",did)
     elif st=="wd_gross":
-        usd=amount(t); method=ctx.user_data.get("wd_method","bkash")
-        minimum=Decimal(get_setting("recharge_min_usd") if method=="recharge" else get_setting("withdraw_min_usd"))
-        if usd is None or usd<minimum:
-            await msg.reply_text(f"সর্বনিম্ন পরিমাণ ${m(minimum)}। আবার লিখুন:"); return
-        rate=Decimal(get_setting("usd_rate") or "100")
-        gross=(usd*rate).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+        gross=amount(t); method=ctx.user_data.get("wd_method","bkash")
+        minimum=Decimal("50") if method=="recharge" else Decimal("100")
+        if gross is None or gross<minimum:
+            await msg.reply_text(f"সর্বনিম্ন পরিমাণ ৳{m(minimum)}। আবার লিখুন:"); return
         fee_pct=Decimal(get_setting("recharge_fee" if method=="recharge" else "withdraw_fee") or "15")
         fee=(gross*fee_pct/Decimal("100")).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP); net=gross-fee
         with conn() as c: r=c.execute("SELECT worker FROM users WHERE id=?",(uid,)).fetchone()
         if Decimal(r["worker"] or 0)<gross:
             await msg.reply_text(f"ব্যালেন্স কম। প্রয়োজন ৳{m(gross)}, আপনার ব্যালেন্স ৳{m(r['worker'] or 0)}।"); return
-        ctx.user_data["form"]={"usd":str(usd),"gross":str(gross),"fee":str(fee),"net":str(net),"method":method}
+        ctx.user_data["form"]={"gross":str(gross),"fee":str(fee),"net":str(net),"method":method}
         ctx.user_data["stage"]="wd_account"
-        label={"bkash":"bKash নম্বর","nagad":"Nagad নম্বর","recharge":"যে মোবাইল নম্বরে রিচার্জ চান"}[method]
-        await msg.reply_text(f"🧾 আপনার হিসাব\nপরিমাণ: ${m(usd)} = ৳{m(gross)}\nফি ({m(fee_pct)}%): ৳{m(fee)}\n✅ আপনি পাবেন: ৳{m(net)}\n\nএখন {label} লিখুন।")
+        label={"bkash":"বিকাশ নম্বর","nagad":"নগদ নম্বর","recharge":"যে মোবাইল নম্বরে রিচার্জ চান"}[method]
+        await msg.reply_text(f"🧾 আপনার উইথড্র হিসাব\nনির্বাচিত পদ্ধতি: {label}\nমোট টাকা: ৳{m(gross)}\nফি ({m(fee_pct)}%): ৳{m(fee)}\n✅ ফি কাটার পর আপনি পাবেন: ৳{m(net)}\n\nহিসাব ঠিক থাকলে এখন {label} লিখুন।")
     elif st=="wd_account":
         if len(t)<8 or len(t)>40: await msg.reply_text("সঠিক নম্বর লিখুন।"); return
         f=ctx.user_data["form"]; g=Decimal(f["gross"])
@@ -319,7 +328,11 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             lines += [f"Deposit #{r['id']} | User {r['user_id']} | ৳{r['amount']} {r['method']}" for r in ds]
             lines += [f"Withdraw #{r['id']} | User {r['user_id']} | ৳{r['gross']} {r['method']}" for r in ws]
             lines += [f"Submission #{r['id']} | Job {r['job_id']} | Worker {r['worker_id']}" for r in ss]
-            await q.message.reply_text("\n".join(lines)); return
+            rows=[]
+            for r in ws:
+                rows.append([InlineKeyboardButton(f"✅ Approve Withdraw #{r['id']}",callback_data=f"review:withdraw:yes:{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:withdraw:no:{r['id']}")])
+            rows.append([InlineKeyboardButton("⬅️ Admin Menu",callback_data="adm:home")])
+            await q.message.reply_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(rows) if rows else None); return
         if d=="adm:users":
             with conn() as c:
                 total=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
@@ -366,9 +379,10 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         method=d.split(":",1)[1]
         if method not in ("bkash","nagad","recharge"): return
         ctx.user_data["wd_method"]=method; ctx.user_data["stage"]="wd_gross"
-        minimum=get_setting("recharge_min_usd") if method=="recharge" else get_setting("withdraw_min_usd")
-        fee=get_setting("recharge_fee") if method=="recharge" else get_setting("withdraw_fee")
-        await q.message.reply_text(f"পদ্ধতি: {method.upper()}\nসর্বনিম্ন: ${minimum}\nফি: {fee}%\nকত USD তুলবেন/রিচার্জ করবেন? পরিমাণ লিখুন:")
+        minimum="50" if method=="recharge" else "100"
+        fee=get_setting("recharge_fee" if method=="recharge" else "withdraw_fee") or "15"
+        ctx.user_data["form"]={}
+        await q.message.reply_text(f"পদ্ধতি: { {'bkash':'বিকাশ','nagad':'নগদ','recharge':'মোবাইল রিচার্জ'}[method] }\nসর্বনিম্ন: ৳{minimum}\nফি: {fee}%\nকত টাকা তুলবেন/রিচার্জ করবেন? BDT-তে পরিমাণ লিখুন:")
         return
     if d.startswith("cat:"):
         try: ci=int(d.split(":")[1]); name,mi=CATS[ci]
