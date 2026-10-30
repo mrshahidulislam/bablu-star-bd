@@ -1,4 +1,4 @@
-import os, sqlite3, logging
+import os, sqlite3, logging, re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -116,7 +116,7 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif t=="💰 বায়ার ব্যালেন্স" and mode=="buyer": await balance(update,u.id,"buyer")
     elif t=="💰 ফ্রিল্যান্সার ব্যালেন্স" and mode=="worker": await balance(update,u.id,"worker")
     elif t=="➕ ডিপোজিট" and mode=="buyer":
-        ctx.user_data["stage"]="dep_amount"; await update.effective_message.reply_text("ডিপোজিটের পরিমাণ লিখুন (সর্বনিম্ন ৳১০)।")
+        ctx.user_data["stage"]="dep_amount"; await update.effective_message.reply_text("ডিপোজিটের পরিমাণ লিখুন (সর্বনিম্ন ৳৫০)।")
     elif t=="🔎 কাজ দেখুন" and mode=="worker":
         with conn() as c: rs=c.execute("SELECT * FROM jobs WHERE status='open' AND count>0 ORDER BY id DESC LIMIT 10").fetchall()
         if not rs: await update.effective_message.reply_text("এখন কোনো খোলা কাজ নেই।")
@@ -459,13 +459,6 @@ async def admin(update,ctx):
         f"Support: {get_setting('support_email','mrshahidulislam8989@gmail.com')}\n\n"
         "নম্বর/ইমেইল পরিবর্তন করতে নিচের বাটনে চাপ দিন।", reply_markup=kb)
 
-
-    if update.effective_user.id!=ADMIN: await update.effective_message.reply_text("শুধু অ্যাডমিনের জন্য।"); return
-    with conn() as c:
-        d=c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"]
-        w=c.execute("SELECT COUNT(*) n FROM withdrawals WHERE status='pending'").fetchone()["n"]
-        s=c.execute("SELECT COUNT(*) n FROM submissions WHERE status='pending'").fetchone()["n"]
-    await update.effective_message.reply_text(f"Admin Dashboard\nPending deposits: {d}\nPending withdrawals: {w}\nPending submissions: {s}")
 async def err(update,ctx):
     log.exception("Bot error",exc_info=ctx.error)
     if update and update.effective_message:
