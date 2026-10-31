@@ -208,6 +208,20 @@ async def stage_input(update,ctx,st,t):
             await msg.reply_text("মেসেজ ৫–৩৫০০ অক্ষরের মধ্যে লিখুন।")
             ctx.user_data["admin_setting_key"]=key
             return
+        elif key in ("withdraw_fee","job_fee","referral_rate"):
+            try: rate=Decimal(t)
+            except Exception: rate=Decimal("-1")
+            if not rate.is_finite() or rate < 0 or rate > 1:
+                await msg.reply_text("শতকরা হার ০ থেকে ১-এর মধ্যে দশমিক হিসেবে দিন। যেমন ১৫% হলে 0.15")
+                ctx.user_data["admin_setting_key"]=key
+                return
+        elif key in ("deposit_min","withdraw_min","recharge_min"):
+            a=amount(t)
+            if a is None:
+                await msg.reply_text("সঠিক ধনাত্মক টাকার পরিমাণ লিখুন।")
+                ctx.user_data["admin_setting_key"]=key
+                return
+            t=str(a)
         set_setting(key,t,uid); ctx.user_data.pop("stage",None)
         await msg.reply_text("✅ সেটিং সেভ হয়েছে। পরিবর্তন দেখতে /admin লিখুন।")
     elif st=="job_title":
@@ -237,7 +251,7 @@ async def stage_input(update,ctx,st,t):
         await msg.reply_text(f"ক্যাটাগরি: {CATS[f['cat']][0]}\nশিরোনাম: {f['title']}\nবিবরণ: {f['desc']}\nকাজ: {f['count']}\nপ্রতি কাজ: ৳{m(f['price'])}\nমোট বাজেট: ৳{m(total)}\nনিয়ম: {t}\nপোস্ট করবেন?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ পোস্ট",callback_data="job:yes"),InlineKeyboardButton("❌ বাতিল",callback_data="job:no")]]))
     elif st=="dep_amount":
         a=amount(t)
-        if a is None or a<50: await msg.reply_text("সর্বনিম্ন ডিপোজিট ৳৫০।"); return
+        if a is None or a<Decimal(get_setting("deposit_min","50")): await msg.reply_text(f"সর্বনিম্ন ডিপোজিট ৳{m(get_setting('deposit_min','50'))}।"); return
         ctx.user_data["form"]={"amount":str(a)}; ctx.user_data["stage"]="dep_method"
         await msg.reply_text("ডিপোজিটের পদ্ধতি বেছে নিন:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟣 বিকাশ (bKash)",callback_data="depmethod:bKash"),InlineKeyboardButton("🟠 নগদ (Nagad)",callback_data="depmethod:Nagad")]]))
@@ -323,7 +337,38 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if is_banned(uid) and d!="support": await banned_notice(q.message); return
     if d=="support":
         await q.message.reply_text(f"📩 Support Email: {get_setting('support_email','mrshahidulislam8989@gmail.com')}\nআপনার Telegram ID: {uid}"); return
-    if d=="adminrefresh":
+    if d.startswith("adminusers:"):
+        if uid!=ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        page=max(0,int(d.split(":")[1])); size=10; offset=page*size
+        with conn() as c:
+            total=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+            rows=c.execute("SELECT u.id,u.username,u.first_name,u.worker,u.banned,COALESCE((SELECT SUM(CAST(l.amount AS REAL)) FROM ledger l WHERE l.user_id=u.id AND l.wallet='worker' AND l.kind='earning'),0) earned FROM users u ORDER BY u.created DESC LIMIT ? OFFSET ?",(size,offset)).fetchall()
+        if not rows:
+            await q.message.reply_text("ব্যবহারকারী পাওয়া যায়নি।"); return
+        for r in rows:
+            label="BANNED" if r["banned"] else "ACTIVE"
+            name=(r["first_name"] or "নাম নেই")[:40]
+            uname=("@"+r["username"]) if r["username"] else "username নেই"
+            action="unban" if r["banned"] else "ban"
+            btn="♻️ Unban" if r["banned"] else "⛔ Ban"
+            await q.message.reply_text(f"👤 {name} ({uname})\nID: {r['id']}\nমোট আয়: ৳{m(r['earned'])}\nবর্তমান ব্যালেন্স: ৳{m(r['worker'] or 0)}\nস্ট্যাটাস: {label}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(btn,callback_data=f"adminuser:{action}:{r['id']}" )]]))
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("⬅️ আগের",callback_data=f"adminusers:{page-1}"))
+        if offset+size<total: nav.append(InlineKeyboardButton("পরের ➡️",callback_data=f"adminusers:{page+1}"))
+        if nav: await q.message.reply_text(f"ব্যবহারকারী {offset+1}-{min(offset+size,total)} / {total}",reply_markup=InlineKeyboardMarkup([nav]))
+    elif d.startswith("adminuser:"):
+        if uid!=ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        _,action,raw=d.split(":"); target=int(raw)
+        if target==ADMIN:
+            await q.message.reply_text("নিজের অ্যাডমিন অ্যাকাউন্ট Ban করা যাবে না।"); return
+        if action not in ("ban","unban"): return
+        with conn() as c:
+            c.execute("UPDATE users SET banned=? WHERE id=?",(1 if action=="ban" else 0,target))
+            c.execute("INSERT INTO audit(actor,action,details,created) VALUES(?,?,?,?)",(uid,"user_"+action,str(target),now()))
+        await q.message.reply_text(f"✅ User {target}: {action.upper()} সম্পন্ন।")
+    elif d=="adminrefresh":
         if uid!=ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
         await q.message.reply_text("ড্যাশবোর্ড আপডেট করতে /admin লিখুন।")
@@ -331,11 +376,11 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if uid!=ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
         key=d.split(":",1)[1]
-        allowed={"bkash":"bkash_number","nagad":"nagad_number","support_email":"support_email","withdraw_request_sent":"withdraw_request_sent_text","withdraw_instructions":"withdraw_instructions_text","withdraw_pending":"withdraw_pending_text","withdraw_approved":"withdraw_approved_text","withdraw_rejected":"withdraw_rejected_text"}
+        allowed={"bkash":"bkash_number","nagad":"nagad_number","support_email":"support_email","withdraw_request_sent":"withdraw_request_sent_text","withdraw_instructions":"withdraw_instructions_text","withdraw_pending":"withdraw_pending_text","withdraw_approved":"withdraw_approved_text","withdraw_rejected":"withdraw_rejected_text","withdraw_fee":"withdraw_fee","job_fee":"job_fee","referral_rate":"referral_rate","deposit_min":"deposit_min","withdraw_min":"withdraw_min","recharge_min":"recharge_min"}
         if key not in allowed: return
         ctx.user_data["admin_setting_key"]=allowed[key]
         ctx.user_data["stage"]="admin_setting"
-        labels={"bkash":"বিকাশের পেমেন্ট গ্রহণের নম্বর","nagad":"নগদের পেমেন্ট গ্রহণের নম্বর","support_email":"সাপোর্ট ইমেইল","withdraw_request_sent":"Withdrawal Request জমা দেওয়ার পর পাঠানোর মেসেজ","withdraw_instructions":"Withdrawal নির্দেশনা","withdraw_pending":"Withdrawal Pending মেসেজ","withdraw_approved":"Withdrawal Approved মেসেজ","withdraw_rejected":"Withdrawal Rejected মেসেজ"}
+        labels={"bkash":"বিকাশের পেমেন্ট গ্রহণের নম্বর","nagad":"নগদের পেমেন্ট গ্রহণের নম্বর","support_email":"সাপোর্ট ইমেইল","withdraw_request_sent":"Withdrawal Request জমা দেওয়ার পর পাঠানোর মেসেজ","withdraw_instructions":"Withdrawal নির্দেশনা","withdraw_pending":"Withdrawal Pending মেসেজ","withdraw_approved":"Withdrawal Approved মেসেজ","withdraw_rejected":"Withdrawal Rejected মেসেজ","withdraw_fee":"উইথড্র ফি (১৫% হলে 0.15 লিখুন)","job_fee":"জব পোস্টিং ফি (৫% হলে 0.05 লিখুন)","referral_rate":"রেফারেল বোনাস (১০% হলে 0.10 লিখুন)","deposit_min":"সর্বনিম্ন ডিপোজিট","withdraw_min":"সর্বনিম্ন bKash/Nagad উইথড্র","recharge_min":"সর্বনিম্ন রিচার্জ উইথড্র"}
         await q.message.reply_text(f"{labels[key]} লিখুন। শুধু অ্যাডমিনের দেওয়া সঠিক তথ্য দিন। বাতিল করতে /cancel লিখুন।")
     elif d.startswith("adminlist:"):
         if uid!=ADMIN:
@@ -393,9 +438,9 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         method=d.split(":",1)[1]
         if method not in ("bKash","Nagad","Recharge"): return
         g=Decimal(ctx.user_data["form"]["gross"])
-        if method in ("bKash","Nagad") and g < 100:
+        if method in ("bKash","Nagad") and g < Decimal(get_setting("withdraw_min","100")):
             await q.message.reply_text("বিকাশ/নগদে সর্বনিম্ন উইথড্র ৳১০০। আবার ৳১০০ বা তার বেশি দিয়ে শুরু করুন।"); ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); return
-        if method == "Recharge" and g < 50:
+        if method == "Recharge" and g < Decimal(get_setting("recharge_min","50")):
             await q.message.reply_text("মোবাইল রিচার্জ সর্বনিম্ন ৳৫০।"); ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); return
         ctx.user_data["form"]["method"]=method; ctx.user_data["stage"]="wd_account"
         label={"bKash":"বিকাশ","Nagad":"নগদ","Recharge":"মোবাইল রিচার্জ"}[method]
@@ -478,7 +523,7 @@ async def review(q,ctx,kind,item,yes):
             else:
                 u=c.execute("SELECT referrer,ref_paid FROM users WHERE id=?",(r["user_id"],)).fetchone()
                 if u and u["referrer"] and not u["ref_paid"]:
-                    bonus=(Decimal(r["gross"])*REFERRAL).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+                    bonus=(Decimal(r["gross"])*Decimal(get_setting("referral_rate","0.10"))).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
                     ref=c.execute("SELECT worker FROM users WHERE id=?",(u["referrer"],)).fetchone()
                     if ref:
                         c.execute("UPDATE users SET worker=? WHERE id=?",(str(Decimal(ref["worker"] or 0)+bonus),u["referrer"]))
@@ -556,6 +601,11 @@ async def admin(update,ctx):
         [InlineKeyboardButton("✏️ Withdrawal Request Sent",callback_data="adminset:withdraw_request_sent")],
         [InlineKeyboardButton("✏️ Withdrawal Instructions",callback_data="adminset:withdraw_instructions"),InlineKeyboardButton("✏️ Pending",callback_data="adminset:withdraw_pending")],
         [InlineKeyboardButton("✏️ Approved",callback_data="adminset:withdraw_approved"),InlineKeyboardButton("✏️ Rejected",callback_data="adminset:withdraw_rejected")],
+        [InlineKeyboardButton("👥 ব্যবহারকারী তালিকা",callback_data="adminusers:0")],
+        [InlineKeyboardButton("⚙️ ফি/বোনাস সেট",callback_data="adminset:withdraw_fee"),InlineKeyboardButton("⚙️ জব ফি",callback_data="adminset:job_fee")],
+        [InlineKeyboardButton("🎁 রেফারেল হার",callback_data="adminset:referral_rate")],
+        [InlineKeyboardButton("➕ ডিপোজিট মিনিমাম",callback_data="adminset:deposit_min"),InlineKeyboardButton("➖ উইথড্র মিনিমাম",callback_data="adminset:withdraw_min")],
+        [InlineKeyboardButton("📱 রিচার্জ মিনিমাম",callback_data="adminset:recharge_min")],
         [InlineKeyboardButton("📥 ডিপোজিট যাচাই",callback_data="adminlist:deposit"),InlineKeyboardButton("📤 উত্তোলন যাচাই",callback_data="adminlist:withdraw")],
         [InlineKeyboardButton("🧾 কাজের প্রুফ যাচাই",callback_data="adminlist:submission"),InlineKeyboardButton("🔄 রিফ্রেশ",callback_data="adminrefresh")]
     ])
@@ -565,8 +615,9 @@ async def admin(update,ctx):
         f"📥 অপেক্ষমাণ ডিপোজিট: {d}\n📤 অপেক্ষমাণ উত্তোলন: {w}\n🧾 অপেক্ষমাণ কাজের প্রুফ: {sub}\n\n"
         f"বিকাশ: {get_setting('bkash_number','সেট করা হয়নি')}\n"
         f"নগদ: {get_setting('nagad_number','সেট করা হয়নি')}\n"
-        f"Support: {get_setting('support_email','mrshahidulislam8989@gmail.com')}\n\n"
-        "নম্বর/ইমেইল/Withdrawal মেসেজ পরিবর্তন করতে নিচের বাটনে চাপ দিন।", reply_markup=kb)
+        f"Support: {get_setting('support_email','mrshahidulislam8989@gmail.com')}\n"
+        f"উইথড্র ফি: {Decimal(get_setting('withdraw_fee','0.15'))*100}% | জব ফি: {Decimal(get_setting('job_fee','0.05'))*100}% | রেফারেল: {Decimal(get_setting('referral_rate','0.10'))*100}%\n\n"
+        "নম্বর, ইমেইল, ফি, মিনিমাম ও Withdrawal মেসেজ পরিবর্তন করতে নিচের বাটনে চাপ দিন।", reply_markup=kb)
 
 async def cancel_cmd(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): await banned_notice(update.effective_message); return
