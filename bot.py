@@ -356,21 +356,36 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                 msg=f"সাবমিশন #{row['id']}\nJob: #{row['job_id']}\nWorker: {row['worker_id']}\nProof: {row['proof']}"
             markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"review:{kind}:yes:{row['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:{kind}:no:{row['id']}")]])
             await q.message.reply_text(msg,reply_markup=markup)
+    elif d == "adminjob:start":
+        if uid != ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        ctx.user_data["admin_free_job"] = True
+        ctx.user_data["form"] = {}
+        ctx.user_data["stage"] = "job_category"
+        rows=[]
+        for i in range(0, len(CATS), 2):
+            row=[InlineKeyboardButton(f"{CATS[i][0]} (৳{CATS[i][1]}+)",callback_data=f"cat:{i}")]
+            if i+1 < len(CATS): row.append(InlineKeyboardButton(f"{CATS[i+1][0]} (৳{CATS[i+1][1]}+)",callback_data=f"cat:{i+1}"))
+            rows.append(row)
+        await q.message.reply_text("🛠 অ্যাডমিন ফ্রি জব পোস্ট\nপ্রথমে কাজের ক্যাটাগরি বেছে নিন। অ্যাডমিন পোস্টে কোনো বাজেট/পোস্ট ফি কাটা হবে না।",reply_markup=InlineKeyboardMarkup(rows))
     elif d.startswith("proof_type:"):
         if ctx.user_data.get("stage")!="job_proof_type" or not ctx.user_data.get("form"): await q.message.reply_text("ফর্মটি আর সক্রিয় নেই। আবার কাজ পোস্ট করুন।"); return
         pt=d.split(":",1)[1]
         if pt not in ("photo","text","both"): return
         f=ctx.user_data["form"]; f["proof_type"]=pt; total=Decimal(f["price"])*int(f["count"])
-        with conn() as c: r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone()
-        bal=Decimal(r["buyer"] or 0)
-        if bal<total: await q.message.reply_text(f"ব্যালেন্স কম। মোট বাজেট ৳{m(total)}, বর্তমান ৳{m(bal)}। আগে ডিপোজিট করুন।"); ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); return
+        if not ctx.user_data.get("admin_free_job"):
+            with conn() as c: r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone()
+            bal=Decimal(r["buyer"] or 0)
+            if bal<total: await q.message.reply_text(f"ব্যালেন্স কম। মোট বাজেট ৳{m(total)}, বর্তমান ৳{m(bal)}। পোস্ট ফি যোগ করে প্রয়োজনীয় ব্যালেন্স রাখুন।"); ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); return
         ctx.user_data["stage"]="job_confirm"
         label={"photo":"Screenshot only","text":"Text only","both":"Screenshot + Text"}[pt]
         await q.message.reply_text(f"ক্যাটাগরি: {CATS[f['cat']][0]}\nশিরোনাম: {f['title']}\nবিবরণ: {f['desc']}\nকাজ: {f['count']}\nপ্রতি কাজ: ৳{m(f['price'])}\nমোট বাজেট: ৳{m(total)}\nProof Type: {label}\nনিয়ম: {f['rules']}\nপোস্ট করবেন?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ পোস্ট",callback_data="job:yes"),InlineKeyboardButton("❌ বাতিল",callback_data="job:no")]]))
     elif d.startswith("cat:"):
         try: ci=int(d.split(":")[1]); name,mi=CATS[ci]
         except: return
-        ctx.user_data["form"]={"cat":ci}; ctx.user_data["stage"]="job_title"
+        if ctx.user_data.get("admin_free_job") and uid != ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        ctx.user_data.setdefault("form", {})["cat"]=ci; ctx.user_data["stage"]="job_title"
         await q.message.reply_text(f"ক্যাটাগরি: {name}\nসর্বনিম্ন দাম ৳{mi}\nকাজের শিরোনাম লিখুন।")
     elif d.startswith("wdmethod:"):
         if ctx.user_data.get("stage")!="wd_method" or not ctx.user_data.get("form"):
@@ -401,18 +416,27 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); await q.message.reply_text("কাজ পোস্ট বাতিল।")
     elif d=="job:yes":
         if ctx.user_data.get("stage")!="job_confirm" or not ctx.user_data.get("form"): await q.message.reply_text("ফর্মটি আর সক্রিয় নেই।"); return
-        f=ctx.user_data["form"]; total=Decimal(f["price"])*int(f["count"]); post_fee=(total*Decimal(get_setting("job_fee","0.05"))).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP); charge=total+post_fee
+        f=ctx.user_data["form"]; total=Decimal(f["price"])*int(f["count"]); is_admin_free=bool(ctx.user_data.get("admin_free_job") and uid==ADMIN)
+        post_fee=Decimal("0") if is_admin_free else (total*Decimal(get_setting("job_fee","0.05"))).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+        charge=Decimal("0") if is_admin_free else total+post_fee
         with conn() as c:
-            c.execute("BEGIN IMMEDIATE"); r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone(); bal=Decimal(r["buyer"] or 0)
-            if bal<charge: c.rollback(); await q.message.reply_text(f"ব্যালেন্স কম। বাজেট ৳{m(total)} + ৫% পোস্ট ফি ৳{m(post_fee)} = মোট ৳{m(charge)} দরকার।"); return
-            c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-charge),uid))
+            c.execute("BEGIN IMMEDIATE")
+            if not is_admin_free:
+                r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone(); bal=Decimal(r["buyer"] or 0)
+                if bal<charge: c.rollback(); await q.message.reply_text(f"ব্যালেন্স কম। বাজেট ৳{m(total)} + ৫% পোস্ট ফি ৳{m(post_fee)} = মোট ৳{m(charge)} দরকার। আগে ডিপোজিট করুন।"); return
+                c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-charge),uid))
             cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,proof_type,status,created) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],f.get("proof_type","text"),"open",now())); jid=cur.lastrowid
-            c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-total),"escrow",f"Job #{jid} budget",now()))
-            if post_fee:
-                c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-post_fee),"job_fee",f"Job #{jid} 5% posting fee",now()))
-        ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
-        await q.message.reply_text(f"কাজ #{jid} পোস্ট হয়েছে। বাজেট ৳{m(total)}; ৫% পোস্ট ফি ৳{m(post_fee)}; মোট কাটা হয়েছে ৳{m(charge)}।")
-        await admin_msg(ctx,f"New job #{jid}: {f['title']} | buyer {uid} | budget ৳{m(total)}")
+            if not is_admin_free:
+                c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-total),"escrow",f"Job #{jid} budget",now()))
+                if post_fee:
+                    c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-post_fee),"job_fee",f"Job #{jid} 5% posting fee",now()))
+            c.execute("INSERT INTO audit(actor,action,details,created) VALUES(?,?,?,?)",(uid,"job_posted_admin_free" if is_admin_free else "job_posted_buyer",f"Job #{jid}; budget {m(total)}; fee {m(post_fee)}",now()))
+        ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); ctx.user_data.pop("admin_free_job",None)
+        if is_admin_free:
+            await q.message.reply_text(f"✅ অ্যাডমিন হিসেবে কাজ #{jid} বিনা খরচে পোস্ট হয়েছে। কোনো ডিপোজিট বা পোস্ট ফি কাটা হয়নি।")
+        else:
+            await q.message.reply_text(f"✅ কাজ #{jid} পোস্ট হয়েছে। বাজেট ৳{m(total)}; ৫% পোস্ট ফি ৳{m(post_fee)}; মোট কাটা হয়েছে ৳{m(charge)}।")
+        await admin_msg(ctx,f"New job #{jid}: {f['title']} | poster {uid} | budget ৳{m(total)} | admin_free={is_admin_free}")
     elif d.startswith("submit:"):
         jid=int(d.split(":")[1])
         with conn() as c:
@@ -526,6 +550,7 @@ async def admin(update,ctx):
         users=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
         jobs=c.execute("SELECT COUNT(*) n FROM jobs WHERE status='open'").fetchone()["n"]
     kb=InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ ফ্রিতে কাজ পোস্ট",callback_data="adminjob:start")],
         [InlineKeyboardButton("💳 বিকাশ নম্বর সেট",callback_data="adminset:bkash"),InlineKeyboardButton("💳 নগদ নম্বর সেট",callback_data="adminset:nagad")],
         [InlineKeyboardButton("📧 সাপোর্ট ইমেইল",callback_data="adminset:support_email")],
         [InlineKeyboardButton("✏️ Withdrawal Request Sent",callback_data="adminset:withdraw_request_sent")],
