@@ -561,13 +561,14 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if kind=="submission":
             with conn() as c:
                 own=c.execute("SELECT j.buyer_id,j.is_admin_job FROM submissions s JOIN jobs j ON j.id=s.job_id WHERE s.id=? AND s.status='pending'",(item,)).fetchone()
-            allowed=bool(own and ((own["is_admin_job"] and uid==ADMIN) or (not own["is_admin_job"] and uid==own["buyer_id"])))
+            allowed=bool(own and (uid==ADMIN or uid==own["buyer_id"]))
             if not allowed:
                 await q.message.reply_text("⛔ এই সাবমিশন যাচাই করার অনুমতি আপনার নেই।"); return
         elif uid!=ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন পারবেন।"); return
         await review(q,ctx,kind,item,yes)
 async def review(q,ctx,kind,item,yes):
+    decision = "yes" if yes else "no"
     target=0; usermsg=""
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
