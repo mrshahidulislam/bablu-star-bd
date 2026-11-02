@@ -2,7 +2,7 @@ import os, logging, re, psycopg2
 from psycopg2.extras import RealDictCursor
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -71,16 +71,17 @@ class PGCursor:
 
         # Capture generated IDs for existing code that reads cursor.lastrowid.
         self.lastrowid = None
-        if q.lstrip().upper().startswith("INSERT INTO") and " RETURNING " not in q.upper():
+        if q.lstrip().upper().startswith("INSERT INTO"):
             table_match = re.match(r"\s*INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)", q, re.I)
             table = table_match.group(1).lower() if table_match else ""
             if table in {"jobs", "submissions", "deposits", "withdrawals", "ledger", "audit"}:
-                q = q.rstrip().rstrip(";") + " RETURNING id"
+                if " RETURNING " not in q.upper():
+                    q = q.rstrip().rstrip(";") + " RETURNING id"
                 self._cursor.execute(q, params or ())
                 row = self._cursor.fetchone()
                 if row:
                     self.lastrowid = row["id"]
-                self.rowcount = 1
+                self.rowcount = 1 if row else 0
                 return self
 
         self._cursor.execute(q, params or ())
@@ -147,59 +148,6 @@ def conn():
 def init():
     with conn() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
-            buyer TEXT DEFAULT '0', worker TEXT DEFAULT '0', referrer BIGINT,
-            ref_paid INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, created TEXT,
-            ban_reason TEXT DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS jobs(
-            id BIGSERIAL PRIMARY KEY, buyer_id BIGINT, cat INTEGER, title TEXT,
-            description TEXT, count INTEGER, price TEXT, reserved TEXT, rules TEXT,
-            proof_type TEXT NOT NULL DEFAULT 'text', status TEXT DEFAULT 'open', created TEXT
-        );
-        CREATE TABLE IF NOT EXISTS submissions(
-            id BIGSERIAL PRIMARY KEY, job_id BIGINT, worker_id BIGINT, proof TEXT,
-            file_id TEXT DEFAULT '', status TEXT DEFAULT 'pending', created TEXT,
-            reviewed TEXT, UNIQUE(job_id,worker_id)
-        );
-        CREATE TABLE IF NOT EXISTS deposits(
-            id BIGSERIAL PRIMARY KEY, user_id BIGINT, amount TEXT, method TEXT,
-            txn TEXT UNIQUE, status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT
-        );
-        CREATE TABLE IF NOT EXISTS withdrawals(
-            id BIGSERIAL PRIMARY KEY, user_id BIGINT, gross TEXT, fee TEXT, net TEXT,
-            method TEXT, account TEXT, status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT
-        );
-        CREATE TABLE IF NOT EXISTS ledger(
-            id BIGSERIAL PRIMARY KEY, user_id BIGINT, wallet TEXT, amount TEXT,
-            kind TEXT, note TEXT, created TEXT
-        );
-        CREATE TABLE IF NOT EXISTS audit(
-            id BIGSERIAL PRIMARY KEY, actor BIGINT, action TEXT, details TEXT, created TEXT
-        );
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
-        """)
-        defaults = {
-            "deposit_min":"50", "withdraw_min":"100", "recharge_min":"50",
-            "withdraw_fee":"0.15", "job_fee":"0.05", "referral_rate":"0.10",
-            "withdraw_request_sent_text":"✅ আপনার Withdrawal Request সফলভাবে জমা হয়েছে।\\n\\n🕒 অ্যাডমিন যাচাই করার পর পেমেন্ট পাঠানো হবে।\\n📌 অনুগ্রহ করে অপেক্ষা করুন।\\n\\n— BABLU STAR BD",
-            "withdraw_instructions_text":"💸 উইথড্রের পরিমাণ লিখুন। বিকাশ/নগদে সর্বনিম্ন ৳১০০, রিচার্জে ৳৫০। সার্ভিস ফি ১৫%।",
-            "withdraw_pending_text":"⏳ আপনার Withdrawal Request অপেক্ষমাণ আছে। অ্যাডমিন যাচাই করছেন।",
-            "withdraw_approved_text":"✅ আপনার Withdrawal Request অনুমোদিত হয়েছে।",
-            "withdraw_rejected_text":"❌ আপনার Withdrawal Request বাতিল হয়েছে। টাকা আপনার ব্যালেন্সে ফেরত দেওয়া হয়েছে."
-        }
-        for key, value in defaults.items():
-            c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (key, value))
-        # Safe additive migration for databases created by earlier bot versions.
-        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS proof_type TEXT NOT NULL DEFAULT 'text'")
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS buyer TEXT DEFAULT '0'")
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS worker TEXT DEFAULT '0'")
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''")
-
-def init():
-    with conn() as c:
-        c.executescript("""
         CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, buyer TEXT DEFAULT '0', worker TEXT DEFAULT '0', referrer BIGINT, ref_paid INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, created TEXT, ban_reason TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS jobs(id BIGSERIAL PRIMARY KEY, buyer_id BIGINT, cat INTEGER, title TEXT, description TEXT, count INTEGER, price TEXT, reserved TEXT, rules TEXT, status TEXT DEFAULT 'open', created TEXT, is_admin_job INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS submissions(id BIGSERIAL PRIMARY KEY, job_id BIGINT, worker_id BIGINT, proof TEXT, file_id TEXT DEFAULT '', status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT, UNIQUE(job_id,worker_id));
@@ -209,7 +157,11 @@ def init():
         CREATE TABLE IF NOT EXISTS audit(id BIGSERIAL PRIMARY KEY, actor BIGINT, action TEXT, details TEXT, created TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
         """)
+        # Safe additive migrations: preserve all existing rows and balances.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS buyer TEXT DEFAULT '0'")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS worker TEXT DEFAULT '0'")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''")
+        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS proof_type TEXT NOT NULL DEFAULT 'text'")
         c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_admin_job INTEGER DEFAULT 0")
         for key, value in DEFAULT_TEXTS.items():
             c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (key, value))
@@ -220,7 +172,7 @@ DEFAULT_TEXTS = {
     "rules": "• কাজের দাম ক্যাটাগরি মিনিমামের কম নয়।\n• ভুয়া অ্যাকাউন্ট, প্রতারণা, স্প্যাম বা প্ল্যাটফর্মের নিয়মভঙ্গকারী কাজ নিষিদ্ধ।\n• বাজেট আগে বায়ার ব্যালেন্স থেকে সংরক্ষিত হবে।\n• প্রুফ অ্যাডমিন অনুমোদন করলে ফ্রিল্যান্সার টাকা পাবেন।\n• ডিপোজিট/উইথড্র ম্যানুয়ালি যাচাই হয়।",
     "payment_info": "bKash/Nagad ডিপোজিট Txn ID দিয়ে জমা দিন। অ্যাডমিন যাচাইয়ের পর ব্যালেন্স যোগ হবে।",
     "banned_text": "⛔ আপনার অ্যাকাউন্ট সীমাবদ্ধ করা হয়েছে। কারণ: {reason}",
-    "deposit_min": "50", "withdraw_min_usd": "1", "recharge_min_usd": "0.50", "withdraw_min": "1", "recharge_min": "0.50",
+    "deposit_min": "50", "withdraw_min_usd": "1", "recharge_min_usd": "0.50", "withdraw_min": "100", "recharge_min": "50",
     "withdraw_fee": "15", "recharge_fee": "15", "post_fee": "5", "referral_bonus": "10", "usd_rate": "100",
     "bkash_number": "পরিবর্তন করা হয়নি", "nagad_number": "পরিবর্তন করা হয়নি",
     "support_url": "https://t.me/"
@@ -243,7 +195,7 @@ def user_row(u):
 def kb(mode):
     return ReplyKeyboardMarkup(BUYER if mode=="buyer" else WORKER if mode=="worker" else MAIN,resize_keyboard=True)
 async def menu(update,ctx,msg="মেনু থেকে অপশন বেছে নিন।"):
-    for k in ("stage","form","proof_job"): ctx.user_data.pop(k,None)
+    for k in ("stage","form","proof_job","admin_user_search","ban_target","admin_edit_key"): ctx.user_data.pop(k,None)
     target=update.effective_message or update.callback_query.message
     await target.reply_text(msg,reply_markup=kb(ctx.user_data.get("mode","main")))
 async def admin_msg(ctx,text,kind=None,item=None):
@@ -275,7 +227,7 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     u=update.effective_user; user_row(u); t=(update.effective_message.text or "").strip()
     with conn() as c:
         r=c.execute("SELECT banned FROM users WHERE id=?",(u.id,)).fetchone()
-    if r and r["banned"]:
+    if r and r["banned"] and not is_admin(u.id):
         with conn() as c: br=c.execute("SELECT ban_reason FROM users WHERE id=?",(u.id,)).fetchone()
         await update.effective_message.reply_text(get_setting("banned_text").format(reason=(br["ban_reason"] if br else "") or "অ্যাডমিনের সিদ্ধান্ত"),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆘 Support",url=get_setting("support_url"))]])); return
     if t in ("🔙 Back / ❌ Cancel","🔙 Back","❌ Cancel","/cancel"):
@@ -348,7 +300,7 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         link=f"https://t.me/{me.username}?start=ref_{u.id}"
         await update.effective_message.reply_text(
             f"আপনার Referral Link:\n{link}\n\nরেফার করা ব্যক্তির প্রথম অনুমোদিত Withdrawal-এর ১০% একবার বোনাস পাবেন।",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy Referral Link",copy_text=CopyTextButton(text=link))]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Referral Link খুলুন",url=link)]])
         )
     elif t=="💳 পেমেন্ট তথ্য":
         await update.effective_message.reply_text("bKash/Nagad ডিপোজিট Txn ID দিয়ে জমা দিন। অ্যাডমিন যাচাইয়ের পর ব্যালেন্স যোগ হবে। উইথড্র/মোবাইল রিচার্জে ১৫% ফি।")
@@ -403,15 +355,16 @@ async def stage_input(update,ctx,st,t):
         await msg.reply_text("উপরের bKash অথবা Nagad বাটন নির্বাচন করুন।")
     elif st=="dep_txn":
         f=ctx.user_data["form"]
-        try:
-            with conn() as c: cur=c.execute("INSERT INTO deposits(user_id,amount,method,txn,created) VALUES(?,?,?,?,?)",(uid,f["amount"],f["method"],t,now())); did=cur.lastrowid
-        except psycopg2.IntegrityError: await msg.reply_text("এই Txn ID আগে জমা হয়েছে।"); return
+        with conn() as c: cur=c.execute("INSERT INTO deposits(user_id,amount,method,txn,created) VALUES(?,?,?,?,?) ON CONFLICT(txn) DO NOTHING",(uid,f["amount"],f["method"],t,now())); did=cur.lastrowid
+        if did is None:
+                await msg.reply_text("এই Txn ID আগে জমা হয়েছে। নতুন Transaction ID দিন।")
+                return
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
         await msg.reply_text("আপনার পেমেন্ট রিকুয়েস্ট সফলভাবে জমা হয়েছে। অনুগ্রহ করে অপেক্ষা করুন। আপনার পেমেন্ট রিকুয়েস্ট জমা দেওয়ার সময় থেকে সর্বোচ্চ ৪৮ ঘণ্টার মধ্যে পেমেন্ট সম্পন্ন করা হবে। ধৈর্য ধরে অপেক্ষা করার জন্য আপনাকে ধন্যবাদ। — BABLU STAR BD")
         await admin_msg(ctx,f"Deposit #{did}\nUser: {uid}\nAmount: ৳{f['amount']}\nMethod: {f['method']}\nTxn: {t}","deposit",did)
     elif st=="wd_gross":
         gross=amount(t); method=ctx.user_data.get("wd_method","bkash")
-        minimum=Decimal("50") if method=="recharge" else Decimal("100")
+        minimum=Decimal(get_setting("recharge_min") or "50") if method=="recharge" else Decimal(get_setting("withdraw_min") or "100")
         if gross is None or gross<minimum:
             await msg.reply_text(f"সর্বনিম্ন পরিমাণ ৳{m(minimum)}। আবার লিখুন:"); return
         fee_pct=Decimal(get_setting("recharge_fee" if method=="recharge" else "withdraw_fee") or "15")
@@ -442,8 +395,10 @@ async def save_proof(update,ctx,jid,proof,fileid):
         job=c.execute("SELECT * FROM jobs WHERE id=?",(jid,)).fetchone()
         if not job or job["status"]!="open" or job["count"]<1: await update.effective_message.reply_text("কাজটি আর খোলা নেই।"); return
         if job["buyer_id"]==uid: await update.effective_message.reply_text("নিজের কাজের প্রুফ দিতে পারবেন না।"); return
-        try: cur=c.execute("INSERT INTO submissions(job_id,worker_id,proof,file_id,created) VALUES(?,?,?,?,?)",(jid,uid,proof,fileid,now())); sid=cur.lastrowid
-        except psycopg2.IntegrityError: await update.effective_message.reply_text("এই কাজের প্রুফ আগে জমা দিয়েছেন।"); return
+        cur=c.execute("INSERT INTO submissions(job_id,worker_id,proof,file_id,created) VALUES(?,?,?,?,?) ON CONFLICT(job_id,worker_id) DO NOTHING",(jid,uid,proof,fileid,now())); sid=cur.lastrowid
+        if sid is None:
+            await update.effective_message.reply_text("এই কাজের প্রুফ আগে জমা দিয়েছেন।")
+            return
     ctx.user_data.pop("stage",None); ctx.user_data.pop("proof_job",None)
     reviewer = "অ্যাডমিন" if job["is_admin_job"] else "বায়ার"
     await update.effective_message.reply_text(f"✅ প্রুফ জমা হয়েছে। সাবমিশন #{sid}; {reviewer} যাচাই করবেন।")
@@ -505,22 +460,24 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             for r in ws:
                 rows.append([InlineKeyboardButton(f"✅ Approve Withdraw #{r['id']}",callback_data=f"review:withdraw:yes:{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:withdraw:no:{r['id']}")])
             for r in ss:
-                rows.append([InlineKeyboardButton(f"🔎 Review Submission #{r['id']}",callback_data=f"adminlist:submission_one:{r['id']}")])
+                rows.append([InlineKeyboardButton(f"🔎 Review Submission #{r['id']}",callback_data=f"adm:submission_one:{r['id']}")])
             rows.append([InlineKeyboardButton("⬅️ Admin Menu",callback_data="adm:home")])
             await q.message.reply_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(rows) if rows else None); return
-        if d.startswith("adminlist:submission_one:"):
+        if d.startswith("adm:submission_one:"):
             sid=int(d.rsplit(":",1)[1])
             with conn() as c:
                 row=c.execute("SELECT s.*,j.title,j.buyer_id,j.is_admin_job FROM submissions s JOIN jobs j ON j.id=s.job_id WHERE s.id=?",(sid,)).fetchone()
             if not row or row["status"]!="pending":
                 await q.message.reply_text("এই সাবমিশনটি আর Pending নেই।"); return
+            if not row["is_admin_job"] and uid != row["buyer_id"]:
+                await q.message.reply_text("⛔ এই সাবমিশনটি সংশ্লিষ্ট বায়ার যাচাই করবেন।"); return
             reviewer="Admin" if row["is_admin_job"] else "Buyer"
             card=f"সাবমিশন #{sid}\\nকাজ: {row['title']}\\nWorker: {row['worker_id']}\\nযাচাই করবেন: {reviewer}\\nপ্রুফ: {row['proof'] or '[ছবি সংযুক্ত]'}"
             await q.message.reply_text(card,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"review:submission:yes:{sid}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:submission:no:{sid}")]])); return
         if d=="adm:users":
             with conn() as c:
                 total=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-                rs=c.execute("SELECT id,username,first_name,banned FROM users ORDER BY created DESC LIMIT 20").fetchall()
+                rs=c.execute("SELECT id,username,first_name,banned FROM users ORDER BY id DESC LIMIT 20").fetchall()
             rows=[]
             for r in rs:
                 state="🚫 BANNED" if r["banned"] else "🟢 ACTIVE"
@@ -563,7 +520,7 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         method=d.split(":",1)[1]
         if method not in ("bkash","nagad","recharge"): return
         ctx.user_data["wd_method"]=method; ctx.user_data["stage"]="wd_gross"
-        minimum="50" if method=="recharge" else "100"
+        minimum=(get_setting("recharge_min") or "50") if method=="recharge" else (get_setting("withdraw_min") or "100")
         fee=get_setting("recharge_fee" if method=="recharge" else "withdraw_fee") or "15"
         ctx.user_data["form"]={}
         await q.message.reply_text(f"পদ্ধতি: { {'bkash':'বিকাশ','nagad':'নগদ','recharge':'মোবাইল রিচার্জ'}[method] }\nসর্বনিম্ন: ৳{minimum}\nফি: {fee}%\nকত টাকা তুলবেন/রিচার্জ করবেন? BDT-তে পরিমাণ লিখুন:")
@@ -645,7 +602,8 @@ async def review(q,ctx,kind,item,yes):
             else:
                 u=c.execute("SELECT referrer,ref_paid FROM users WHERE id=?",(r["user_id"],)).fetchone()
                 if u and u["referrer"] and not u["ref_paid"]:
-                    bonus=(Decimal(r["gross"])*REFERRAL).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+                    bonus_rate=Decimal(get_setting("referral_bonus") or "10") / Decimal("100")
+                    bonus=(Decimal(r["gross"])*bonus_rate).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
                     ref=c.execute("SELECT worker FROM users WHERE id=?",(u["referrer"],)).fetchone()
                     if ref:
                         c.execute("UPDATE users SET worker=? WHERE id=?",(str(Decimal(ref["worker"] or 0)+bonus),u["referrer"]))
