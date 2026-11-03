@@ -320,6 +320,32 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
 async def balance(update,uid,wallet):
     with conn() as c: r=c.execute(f"SELECT {wallet} FROM users WHERE id=?",(uid,)).fetchone()
     await update.effective_message.reply_text(f"আপনার ব্যালেন্স: ৳{m(r[wallet] or 0)}")
+async def show_job_confirmation(msg,ctx,uid):
+    f=ctx.user_data.get("form") or {}
+    total=Decimal(f["price"])*int(f["count"])
+    fee_pct=Decimal(get_setting("post_fee") or "5")
+    if fee_pct < 0 or fee_pct > 100:
+        await msg.reply_text("অ্যাডমিন সেটিংসে Job Posting Fee সঠিকভাবে ০–১০০ এর মধ্যে দিন।")
+        return
+    post_fee=Decimal("0") if is_admin(uid) else (total*fee_pct/Decimal("100")).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+    due=total+post_fee
+    f["post_fee"]=str(post_fee)
+    f["post_fee_pct"]=str(fee_pct)
+    with conn() as c:
+        r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone()
+    bal=Decimal(r["buyer"] or 0)
+    if not is_admin(uid) and bal<due:
+        await msg.reply_text(f"ব্যালেন্স কম। বাজেট ৳{m(total)} + পোস্টিং ফি ৳{m(post_fee)} = মোট ৳{m(due)}, বর্তমান ৳{m(bal)}। আগে ডিপোজিট করুন।")
+        ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
+        return
+    ctx.user_data["stage"]="job_confirm"
+    fee_line=(f"পোস্টিং ফি ({m(fee_pct)}%): ৳{m(post_fee)}\\nমোট কাটা হবে: ৳{m(due)}" if not is_admin(uid) else "পোস্টিং ফি: ৳0 (Admin Job)")
+    proof_labels={"screenshot":"শুধু স্ক্রিনশট","text":"শুধু টেক্সট","both":"স্ক্রিনশট ও টেক্সট"}
+    await msg.reply_text(
+        f"প্ল্যাটফর্ম: {CATS[f['cat']][0]}\\nশিরোনাম: {f['title']}\\nবিবরণ: {f['desc']}\\nকাজ: {f['count']}\\nপ্রতি কাজ: ৳{m(f['price'])}\\nমোট বাজেট: ৳{m(total)}\\n{fee_line}\\nপ্রুফের ধরন: {proof_labels.get(f.get('proof_type'),'শুধু টেক্সট')}\\nনিয়ম: {f['rules']}\\nপোস্ট করবেন?",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ পোস্ট",callback_data="job:yes"),InlineKeyboardButton("❌ বাতিল",callback_data="job:no")]])
+    )
+
 async def stage_input(update,ctx,st,t):
     uid=update.effective_user.id; msg=update.effective_message
     if st=="job_title":
@@ -339,13 +365,17 @@ async def stage_input(update,ctx,st,t):
         f["price"]=str(p); ctx.user_data["stage"]="job_rules"; await msg.reply_text("কাজের নিয়ম এবং কী প্রুফ দিতে হবে লিখুন।")
     elif st=="job_rules":
         if len(t)<3 or len(t)>2000: await msg.reply_text("৩–২০০০ অক্ষরের নিয়ম লিখুন।"); return
-        f=ctx.user_data["form"]; f["rules"]=t; total=Decimal(f["price"])*f["count"]
-        with conn() as c: r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone()
-        bal=Decimal(r["buyer"] or 0)
-        if not is_admin(uid) and bal<total:
-            await msg.reply_text(f"ব্যালেন্স কম। মোট বাজেট ৳{m(total)}, বর্তমান ৳{m(bal)}। আগে ডিপোজিট করুন।"); ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); return
-        ctx.user_data["stage"]="job_confirm"
-        await msg.reply_text(f"প্ল্যাটফর্ম: {CATS[f['cat']][0]}\nশিরোনাম: {f['title']}\nবিবরণ: {f['desc']}\nকাজ: {f['count']}\nপ্রতি কাজ: ৳{m(f['price'])}\nমোট বাজেট: ৳{m(total)}\nনিয়ম: {t}\nপোস্ট করবেন?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ পোস্ট",callback_data="job:yes"),InlineKeyboardButton("❌ বাতিল",callback_data="job:no")]]))
+        ctx.user_data["form"]["rules"]=t
+        ctx.user_data["stage"]="job_proof_type"
+        await msg.reply_text(
+            "কাজ সম্পন্ন করতে ফ্রিল্যান্সারকে কোন ধরনের প্রুফ জমা দিতে হবে?\\n\\n"
+            "একটি অপশন বাধ্যতামূলকভাবে নির্বাচন করুন:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 ১. স্ক্রিনশট",callback_data="proof_type:screenshot")],
+                [InlineKeyboardButton("📝 ২. টেক্সট",callback_data="proof_type:text")],
+                [InlineKeyboardButton("📸📝 ৩. স্ক্রিনশট ও টেক্সট",callback_data="proof_type:both")]
+            ])
+        )
     elif st=="dep_amount":
         a=amount(t)
         if a is None or a<Decimal(get_setting("deposit_min")): await msg.reply_text(f"সর্বনিম্ন ৳{get_setting('deposit_min')} লিখুন।"); return
@@ -380,7 +410,7 @@ async def stage_input(update,ctx,st,t):
         if len(t)<8 or len(t)>40: await msg.reply_text("সঠিক নম্বর লিখুন।"); return
         f=ctx.user_data["form"]; g=Decimal(f["gross"])
         with conn() as c:
-            c.execute("BEGIN IMMEDIATE"); r=c.execute("SELECT worker FROM users WHERE id=?",(uid,)).fetchone(); bal=Decimal(r["worker"] or 0)
+            c.execute("BEGIN IMMEDIATE"); r=c.execute("SELECT worker FROM users WHERE id=? FOR UPDATE",(uid,)).fetchone(); bal=Decimal(r["worker"] or 0)
             if bal<g: c.rollback(); await msg.reply_text("ব্যালেন্স যথেষ্ট নেই।"); return
             c.execute("UPDATE users SET worker=? WHERE id=?",(str(bal-g),uid))
             cur=c.execute("INSERT INTO withdrawals(user_id,gross,fee,net,method,account,created) VALUES(?,?,?,?,?,?,?)",(uid,f["gross"],f["fee"],f["net"],f["method"],t,now())); wid=cur.lastrowid
@@ -388,7 +418,7 @@ async def stage_input(update,ctx,st,t):
         await msg.reply_text("আপনার পেমেন্ট রিকুয়েস্ট সফলভাবে জমা হয়েছে। অনুগ্রহ করে অপেক্ষা করুন। আপনার পেমেন্ট রিকুয়েস্ট জমা দেওয়ার সময় থেকে সর্বোচ্চ ৪৮ ঘণ্টার মধ্যে পেমেন্ট সম্পন্ন করা হবে। ধৈর্য ধরে অপেক্ষা করার জন্য আপনাকে ধন্যবাদ। — BABLU STAR BD")
         await admin_msg(ctx,f"Withdrawal #{wid}\nUser: {uid}\nGross: ৳{f['gross']}\nFee: ৳{f['fee']}\nNet: ৳{f['net']}\nMethod: {f['method']}\nAccount: {t}","withdraw",wid)
     elif st=="proof":
-        await save_proof(update,ctx,ctx.user_data.get("proof_job"),t,"")
+        await receive_proof_text(update,ctx,t)
 async def save_proof(update,ctx,jid,proof,fileid):
     uid=update.effective_user.id
     with conn() as c:
@@ -400,6 +430,7 @@ async def save_proof(update,ctx,jid,proof,fileid):
             await update.effective_message.reply_text("এই কাজের প্রুফ আগে জমা দিয়েছেন।")
             return
     ctx.user_data.pop("stage",None); ctx.user_data.pop("proof_job",None)
+    ctx.user_data.pop("proof_text",None); ctx.user_data.pop("proof_file",None)
     reviewer = "অ্যাডমিন" if job["is_admin_job"] else "বায়ার"
     await update.effective_message.reply_text(f"✅ প্রুফ জমা হয়েছে। সাবমিশন #{sid}; {reviewer} যাচাই করবেন।")
     review_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"review:submission:yes:{sid}"),InlineKeyboardButton("❌ Reject",callback_data=f"review:submission:no:{sid}")]])
@@ -411,9 +442,57 @@ async def save_proof(update,ctx,jid,proof,fileid):
             await ctx.bot.send_photo(reviewer_id, fileid, caption=f"প্রুফ Submission #{sid}")
     except Exception:
         log.exception("submission reviewer notification failed")
+async def receive_proof_text(update,ctx,proof):
+    jid=ctx.user_data.get("proof_job")
+    with conn() as c:
+        job=c.execute("SELECT proof_type FROM jobs WHERE id=?",(jid,)).fetchone()
+    if not job:
+        await update.effective_message.reply_text("কাজটি খুঁজে পাওয়া যায়নি।")
+        return
+    proof_type=job["proof_type"] or "text"
+    if proof_type=="screenshot":
+        await update.effective_message.reply_text("এই কাজের জন্য শুধু স্ক্রিনশট বাধ্যতামূলক। অনুগ্রহ করে স্ক্রিনশট পাঠান।")
+        return
+    if not proof.strip():
+        await update.effective_message.reply_text("প্রুফ হিসেবে টেক্সট লিখুন।")
+        return
+    if proof_type=="both":
+        ctx.user_data["proof_text"]=proof.strip()
+        fileid=ctx.user_data.get("proof_file")
+        if not fileid:
+            await update.effective_message.reply_text("টেক্সট পেয়েছি। এখন বাধ্যতামূলক স্ক্রিনশটটিও পাঠান।")
+            return
+        await save_proof(update,ctx,jid,proof.strip(),fileid)
+        return
+    await save_proof(update,ctx,jid,proof.strip(),"")
+
+async def receive_proof_photo(update,ctx):
+    jid=ctx.user_data.get("proof_job")
+    with conn() as c:
+        job=c.execute("SELECT proof_type FROM jobs WHERE id=?",(jid,)).fetchone()
+    if not job:
+        await update.effective_message.reply_text("কাজটি খুঁজে পাওয়া যায়নি।")
+        return
+    proof_type=job["proof_type"] or "text"
+    fileid=update.effective_message.photo[-1].file_id
+    if proof_type=="text":
+        await update.effective_message.reply_text("এই কাজের জন্য শুধু টেক্সট প্রুফ বাধ্যতামূলক। অনুগ্রহ করে টেক্সট লিখুন।")
+        return
+    if proof_type=="both":
+        ctx.user_data["proof_file"]=fileid
+        proof=ctx.user_data.get("proof_text","").strip()
+        if not proof:
+            await update.effective_message.reply_text("স্ক্রিনশট পেয়েছি। এখন বাধ্যতামূলক টেক্সট প্রুফটিও লিখুন।")
+            return
+        await save_proof(update,ctx,jid,proof,fileid)
+        return
+    await save_proof(update,ctx,jid,update.effective_message.caption or "Screenshot proof",fileid)
+
 async def photo(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    if ctx.user_data.get("stage")!="proof": await update.effective_message.reply_text("আগে কোনো কাজের 'প্রুফ জমা দিন' বাটন চাপুন।"); return
-    await save_proof(update,ctx,ctx.user_data.get("proof_job"),update.effective_message.caption or "Screenshot proof",update.effective_message.photo[-1].file_id)
+    if ctx.user_data.get("stage")!="proof":
+        await update.effective_message.reply_text("আগে কোনো কাজের 'প্রুফ জমা দিন' বাটন চাপুন।")
+        return
+    await receive_proof_photo(update,ctx)
 async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); d=q.data or ""; uid=q.from_user.id; user_row(q.from_user)
     with conn() as c:
@@ -530,23 +609,38 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         except: return
         ctx.user_data["form"]={"cat":ci}; ctx.user_data["stage"]="job_title"
         await q.message.reply_text(f"প্ল্যাটফর্ম: {name}\nসর্বনিম্ন দাম ৳{mi}\nকাজের শিরোনাম লিখুন।")
+    elif d.startswith("proof_type:"):
+        if ctx.user_data.get("stage")!="job_proof_type" or not ctx.user_data.get("form"):
+            await q.message.reply_text("কাজের ফর্মটি আর সক্রিয় নেই।")
+            return
+        proof_type=d.split(":",1)[1]
+        if proof_type not in ("screenshot","text","both"):
+            await q.message.reply_text("প্রুফের ধরন সঠিক নয়।")
+            return
+        ctx.user_data["form"]["proof_type"]=proof_type
+        await show_job_confirmation(q.message,ctx,uid)
     elif d=="job:no":
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None); await q.message.reply_text("কাজ পোস্ট বাতিল।")
     elif d=="job:yes":
         if ctx.user_data.get("stage")!="job_confirm" or not ctx.user_data.get("form"): await q.message.reply_text("ফর্মটি আর সক্রিয় নেই।"); return
         f=ctx.user_data["form"]; total=Decimal(f["price"])*int(f["count"])
+        admin_job=is_admin(uid)
+        fee_pct=Decimal(f.get("post_fee_pct", get_setting("post_fee") or "5"))
+        post_fee=Decimal("0") if admin_job else Decimal(f.get("post_fee", "0"))
+        due=total+post_fee
         with conn() as c:
-            c.execute("BEGIN IMMEDIATE"); r=c.execute("SELECT buyer FROM users WHERE id=?",(uid,)).fetchone(); bal=Decimal(r["buyer"] or 0)
-            admin_job=is_admin(uid)
-            if not admin_job and bal<total: c.rollback(); await q.message.reply_text("বায়ার ব্যালেন্স কম। আগে ডিপোজিট করুন।"); return
+            c.execute("BEGIN IMMEDIATE"); r=c.execute("SELECT buyer FROM users WHERE id=? FOR UPDATE",(uid,)).fetchone(); bal=Decimal(r["buyer"] or 0)
+            if not admin_job and bal<due: c.rollback(); await q.message.reply_text(f"বায়ার ব্যালেন্স কম। বাজেট ও ফি মিলিয়ে ৳{m(due)} দরকার। আগে ডিপোজিট করুন।"); return
             if not admin_job:
-                c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-total),uid))
-            cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,status,created,is_admin_job) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],"open" if admin_job else "pending_admin",now(),1 if admin_job else 0)); jid=cur.lastrowid
+                c.execute("UPDATE users SET buyer=? WHERE id=?",(str(bal-due),uid))
+            cur=c.execute("INSERT INTO jobs(buyer_id,cat,title,description,count,price,reserved,rules,status,created,is_admin_job,proof_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid,f["cat"],f["title"],f["desc"],f["count"],f["price"],str(total),f["rules"],"open" if admin_job else "pending_admin",now(),1 if admin_job else 0,f.get("proof_type","text"))); jid=cur.lastrowid
             if not admin_job:
                 c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-total),"escrow",f"Job #{jid}",now()))
+                if post_fee:
+                    c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(uid,"buyer",str(-post_fee),"job_post_fee",f"{m(fee_pct)}% Job Posting Fee #{jid}",now()))
         ctx.user_data.pop("stage",None); ctx.user_data.pop("form",None)
-        await q.message.reply_text(f"কাজ #{jid} জমা হয়েছে। মোট বাজেট ৳{m(total)}\n"+("👑 Admin Job: সরাসরি প্রকাশিত হয়েছে; ডিপোজিট/পোস্টিং ফি লাগেনি।" if is_admin(uid) else "বাজেট সংরক্ষিত হয়েছে। অ্যাডমিন অনুমোদনের পর কাজটি ফ্রিল্যান্সারদের দেখানো হবে।"))
-        if not is_admin(uid): await admin_msg(ctx,f"নতুন Job Approval দরকার\nJob #{jid}: {f['title']} | Buyer {uid} | Budget ৳{m(total)}", "job", jid)
+        await q.message.reply_text(f"কাজ #{jid} জমা হয়েছে। মোট বাজেট ৳{m(total)}\n"+(f"পোস্টিং ফি ৳{m(post_fee)}; মোট কাটা হয়েছে ৳{m(due)}। অ্যাডমিন অনুমোদনের পর কাজটি ফ্রিল্যান্সারদের দেখানো হবে।" if not admin_job else "👑 Admin Job: সরাসরি প্রকাশিত হয়েছে; ডিপোজিট/পোস্টিং ফি লাগেনি।"))
+        if not admin_job: await admin_msg(ctx,f"নতুন Job Approval দরকার\nJob #{jid}: {f['title']} | Buyer {uid} | Budget ৳{m(total)} | Posting Fee ৳{m(post_fee)}", "job", jid)
     elif d.startswith("submit:"):
         jid=int(d.split(":")[1])
         with conn() as c:
@@ -555,7 +649,11 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         elif j["buyer_id"]==uid: await q.message.reply_text("নিজের কাজ করা যাবে না।")
         elif ex: await q.message.reply_text("এই কাজের প্রুফ আগে জমা দিয়েছেন।")
         else:
-            ctx.user_data["proof_job"]=jid; ctx.user_data["stage"]="proof"; await q.message.reply_text("কাজের প্রুফ লিখুন অথবা স্ক্রিনশট পাঠান। Cancel বাটন কাজ করবে।")
+            ctx.user_data["proof_job"]=jid; ctx.user_data["stage"]="proof"
+            ctx.user_data.pop("proof_text",None); ctx.user_data.pop("proof_file",None)
+            ptype=j["proof_type"] or "text"
+            prompts={"screenshot":"এই কাজের জন্য স্ক্রিনশট বাধ্যতামূলক। স্ক্রিনশট পাঠান।","text":"এই কাজের জন্য টেক্সট প্রুফ বাধ্যতামূলক। প্রুফ লিখুন।","both":"এই কাজের জন্য স্ক্রিনশট ও টেক্সট—দুটিই বাধ্যতামূলক। যেকোনো একটি আগে পাঠাতে পারেন।"}
+            await q.message.reply_text(prompts.get(ptype,prompts["text"])+" Cancel বাটন ব্যবহার করে বাতিল করতে পারবেন।")
     elif d.startswith("review:"):
         _,kind,decision,raw=d.split(":"); item=int(raw); yes=decision=="yes"
         if kind=="submission":
@@ -573,7 +671,7 @@ async def review(q,ctx,kind,item,yes):
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
         if kind=="job":
-            r=c.execute("SELECT * FROM jobs WHERE id=?",(item,)).fetchone()
+            r=c.execute("SELECT * FROM jobs WHERE id=? FOR UPDATE",(item,)).fetchone()
             if not r or r["status"]!="pending_admin": await q.message.reply_text("কাজটি আর Pending নেই।"); return
             if yes:
                 c.execute("UPDATE jobs SET status='open' WHERE id=? AND status='pending_admin'",(item,))
@@ -581,43 +679,43 @@ async def review(q,ctx,kind,item,yes):
             else:
                 c.execute("UPDATE jobs SET status='rejected',reserved='0' WHERE id=? AND status='pending_admin'",(item,))
                 if not r["is_admin_job"]:
-                    u=c.execute("SELECT buyer FROM users WHERE id=?",(r["buyer_id"],)).fetchone()
+                    u=c.execute("SELECT buyer FROM users WHERE id=? FOR UPDATE",(r["buyer_id"],)).fetchone()
                     refund=Decimal(r["reserved"] or "0")
                     c.execute("UPDATE users SET buyer=? WHERE id=?",(str(Decimal(u["buyer"] or "0")+refund),r["buyer_id"]))
                     c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(r["buyer_id"],"buyer",str(refund),"job_refund",f"Rejected Job #{item}",now()))
                 target=r["buyer_id"]; usermsg=f"আপনার Job #{item} বাতিল হয়েছে। সংরক্ষিত বাজেট ফেরত দেওয়া হয়েছে।"
         elif kind=="deposit":
-            r=c.execute("SELECT * FROM deposits WHERE id=?",(item,)).fetchone()
+            r=c.execute("SELECT * FROM deposits WHERE id=? FOR UPDATE",(item,)).fetchone()
             if not r or r["status"]!="pending": await q.message.reply_text("ইতিমধ্যে প্রসেস করা হয়েছে।"); return
             c.execute("UPDATE deposits SET status=?,reviewed=? WHERE id=? AND status='pending'",("approved" if yes else "rejected",now(),item))
             if yes:
-                u=c.execute("SELECT buyer FROM users WHERE id=?",(r["user_id"],)).fetchone(); b=Decimal(u["buyer"] or 0)+Decimal(r["amount"]); c.execute("UPDATE users SET buyer=? WHERE id=?",(str(b),r["user_id"]))
+                u=c.execute("SELECT buyer FROM users WHERE id=? FOR UPDATE",(r["user_id"],)).fetchone(); b=Decimal(u["buyer"] or 0)+Decimal(r["amount"]); c.execute("UPDATE users SET buyer=? WHERE id=?",(str(b),r["user_id"]))
                 c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(r["user_id"],"buyer",r["amount"],"deposit",f"Deposit #{item}",now()))
             target=r["user_id"]; usermsg=f"ডিপোজিট #{item} {'অনুমোদিত' if yes else 'বাতিল'} হয়েছে।"
         elif kind=="withdraw":
-            r=c.execute("SELECT * FROM withdrawals WHERE id=?",(item,)).fetchone()
+            r=c.execute("SELECT * FROM withdrawals WHERE id=? FOR UPDATE",(item,)).fetchone()
             if not r or r["status"]!="pending": await q.message.reply_text("ইতিমধ্যে প্রসেস করা হয়েছে।"); return
             c.execute("UPDATE withdrawals SET status=?,reviewed=? WHERE id=? AND status='pending'",("approved" if yes else "rejected",now(),item))
             if not yes:
-                u=c.execute("SELECT worker FROM users WHERE id=?",(r["user_id"],)).fetchone(); b=Decimal(u["worker"] or 0)+Decimal(r["gross"]); c.execute("UPDATE users SET worker=? WHERE id=?",(str(b),r["user_id"]))
+                u=c.execute("SELECT worker FROM users WHERE id=? FOR UPDATE",(r["user_id"],)).fetchone(); b=Decimal(u["worker"] or 0)+Decimal(r["gross"]); c.execute("UPDATE users SET worker=? WHERE id=?",(str(b),r["user_id"]))
             else:
-                u=c.execute("SELECT referrer,ref_paid FROM users WHERE id=?",(r["user_id"],)).fetchone()
+                u=c.execute("SELECT referrer,ref_paid FROM users WHERE id=? FOR UPDATE",(r["user_id"],)).fetchone()
                 if u and u["referrer"] and not u["ref_paid"]:
                     bonus_rate=Decimal(get_setting("referral_bonus") or "10") / Decimal("100")
                     bonus=(Decimal(r["gross"])*bonus_rate).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
-                    ref=c.execute("SELECT worker FROM users WHERE id=?",(u["referrer"],)).fetchone()
+                    ref=c.execute("SELECT worker FROM users WHERE id=? FOR UPDATE",(u["referrer"],)).fetchone()
                     if ref:
                         c.execute("UPDATE users SET worker=? WHERE id=?",(str(Decimal(ref["worker"] or 0)+bonus),u["referrer"]))
                         c.execute("UPDATE users SET ref_paid=1 WHERE id=?",(r["user_id"],))
                         c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(u["referrer"],"worker",str(bonus),"referral",f"Referral user {r['user_id']}",now()))
             target=r["user_id"]; usermsg=f"উইথড্র #{item} {'অনুমোদিত' if yes else 'বাতিল'} হয়েছে।"
         elif kind=="submission":
-            r=c.execute("SELECT * FROM submissions WHERE id=?",(item,)).fetchone()
+            r=c.execute("SELECT * FROM submissions WHERE id=? FOR UPDATE",(item,)).fetchone()
             if not r or r["status"]!="pending": await q.message.reply_text("ইতিমধ্যে প্রসেস করা হয়েছে।"); return
-            j=c.execute("SELECT * FROM jobs WHERE id=?",(r["job_id"],)).fetchone()
+            j=c.execute("SELECT * FROM jobs WHERE id=? FOR UPDATE",(r["job_id"],)).fetchone()
             if not j: await q.message.reply_text("কাজ নেই।"); return
             if yes and j["count"]>0 and Decimal(j["reserved"])>=Decimal(j["price"]):
-                pay=Decimal(j["price"]); u=c.execute("SELECT worker FROM users WHERE id=?",(r["worker_id"],)).fetchone()
+                pay=Decimal(j["price"]); u=c.execute("SELECT worker FROM users WHERE id=? FOR UPDATE",(r["worker_id"],)).fetchone()
                 c.execute("UPDATE users SET worker=? WHERE id=?",(str(Decimal(u["worker"] or 0)+pay),r["worker_id"]))
                 left=Decimal(j["reserved"])-pay; count=j["count"]-1
                 c.execute("UPDATE jobs SET reserved=?,count=?,status=? WHERE id=?",(str(max(left,Decimal(0))),max(count,0),"completed" if count<=0 or left<=0 else "open",j["id"]))
