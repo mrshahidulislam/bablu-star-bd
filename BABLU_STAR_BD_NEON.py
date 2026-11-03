@@ -150,7 +150,7 @@ def init():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, buyer TEXT DEFAULT '0', worker TEXT DEFAULT '0', referrer BIGINT, ref_paid INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, created TEXT, ban_reason TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS jobs(id BIGSERIAL PRIMARY KEY, buyer_id BIGINT, cat INTEGER, title TEXT, description TEXT, count INTEGER, price TEXT, reserved TEXT, rules TEXT, status TEXT DEFAULT 'open', created TEXT, is_admin_job INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS submissions(id BIGSERIAL PRIMARY KEY, job_id BIGINT, worker_id BIGINT, proof TEXT, file_id TEXT DEFAULT '', status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT, UNIQUE(job_id,worker_id));
+        CREATE TABLE IF NOT EXISTS submissions(id BIGSERIAL PRIMARY KEY, job_id BIGINT, worker_id BIGINT, proof TEXT, file_id TEXT DEFAULT '', status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT, rejection_reason TEXT DEFAULT '', UNIQUE(job_id,worker_id));
         CREATE TABLE IF NOT EXISTS deposits(id BIGSERIAL PRIMARY KEY, user_id BIGINT, amount TEXT, method TEXT, txn TEXT UNIQUE, status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT);
         CREATE TABLE IF NOT EXISTS withdrawals(id BIGSERIAL PRIMARY KEY, user_id BIGINT, gross TEXT, fee TEXT, net TEXT, method TEXT, account TEXT, status TEXT DEFAULT 'pending', created TEXT, reviewed TEXT);
         CREATE TABLE IF NOT EXISTS ledger(id BIGSERIAL PRIMARY KEY, user_id BIGINT, wallet TEXT, amount TEXT, kind TEXT, note TEXT, created TEXT);
@@ -163,6 +163,7 @@ def init():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''")
         c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS proof_type TEXT NOT NULL DEFAULT 'text'")
         c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_admin_job INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE submissions ADD COLUMN IF NOT EXISTS rejection_reason TEXT DEFAULT ''")
         for key, value in DEFAULT_TEXTS.items():
             c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (key, value))
 
@@ -246,6 +247,21 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"🚫 User {target} Ban করা হয়েছে। কারণ: {t[:500]}")
         try: await ctx.bot.send_message(target,"⛔ আপনার অ্যাকাউন্ট সীমাবদ্ধ করা হয়েছে।\nকারণ: "+t[:500],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆘 Support",url=get_setting("support_url"))]]))
         except Exception: pass
+        return
+    if ctx.user_data.get("pending_submission_rejection"):
+        sid=int(ctx.user_data.pop("pending_submission_rejection"))
+        reason=t.strip()
+        if len(reason)<3:
+            ctx.user_data["pending_submission_rejection"]=sid
+            await update.effective_message.reply_text("রিজেক্টের কারণ কমপক্ষে ৩ অক্ষরে লিখুন।")
+            return
+        if len(reason)>1000: reason=reason[:1000]
+        with conn() as c:
+            own=c.execute("SELECT s.status,j.buyer_id FROM submissions s JOIN jobs j ON j.id=s.job_id WHERE s.id=?",(sid,)).fetchone()
+        if not own or own["status"]!="pending" or not (is_admin(u.id) or u.id==own["buyer_id"]):
+            await update.effective_message.reply_text("এই সাবমিশন রিজেক্ট করার অনুমতি নেই অথবা এটি আর Pending নেই।")
+            return
+        await review_from_message(update,ctx,sid,reason)
         return
     if is_admin(u.id) and ctx.user_data.get("admin_edit_key"):
         key=ctx.user_data.pop("admin_edit_key")
@@ -488,6 +504,13 @@ async def receive_proof_photo(update,ctx):
         return
     await save_proof(update,ctx,jid,update.effective_message.caption or "Screenshot proof",fileid)
 
+async def review_from_message(update,ctx,sid,reason):
+    # Reuse the same transactional review logic as callback-based approvals.
+    class _Q:
+        from_user = update.effective_user
+        message = update.effective_message
+    await review(_Q,ctx,"submission",sid,False,reason)
+
 async def photo(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if ctx.user_data.get("stage")!="proof":
         await update.effective_message.reply_text("আগে কোনো কাজের 'প্রুফ জমা দিন' বাটন চাপুন।")
@@ -548,7 +571,7 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                 row=c.execute("SELECT s.*,j.title,j.buyer_id,j.is_admin_job FROM submissions s JOIN jobs j ON j.id=s.job_id WHERE s.id=?",(sid,)).fetchone()
             if not row or row["status"]!="pending":
                 await q.message.reply_text("এই সাবমিশনটি আর Pending নেই।"); return
-            if not row["is_admin_job"] and uid != row["buyer_id"]:
+            if uid != ADMIN and not row["is_admin_job"] and uid != row["buyer_id"]:
                 await q.message.reply_text("⛔ এই সাবমিশনটি সংশ্লিষ্ট বায়ার যাচাই করবেন।"); return
             reviewer="Admin" if row["is_admin_job"] else "Buyer"
             card=f"সাবমিশন #{sid}\\nকাজ: {row['title']}\\nWorker: {row['worker_id']}\\nযাচাই করবেন: {reviewer}\\nপ্রুফ: {row['proof'] or '[ছবি সংযুক্ত]'}"
@@ -662,10 +685,14 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             allowed=bool(own and (uid==ADMIN or uid==own["buyer_id"]))
             if not allowed:
                 await q.message.reply_text("⛔ এই সাবমিশন যাচাই করার অনুমতি আপনার নেই।"); return
+            if not yes:
+                ctx.user_data["pending_submission_rejection"]=item
+                await q.message.reply_text(f"❌ Submission #{item} Reject করার কারণ লিখুন। কারণটি Freelancer-কে পাঠানো হবে এবং Database-এ সংরক্ষিত হবে।\nবাতিল করতে /cancel লিখুন।")
+                return
         elif uid!=ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন পারবেন।"); return
         await review(q,ctx,kind,item,yes)
-async def review(q,ctx,kind,item,yes):
+async def review(q,ctx,kind,item,yes,rejection_reason=""):
     decision = "yes" if yes else "no"
     target=0; usermsg=""
     with conn() as c:
@@ -722,10 +749,12 @@ async def review(q,ctx,kind,item,yes):
                 c.execute("INSERT INTO ledger(user_id,wallet,amount,kind,note,created) VALUES(?,?,?,?,?,?)",(r["worker_id"],"worker",str(pay),"earning",f"Job #{j['id']}",now()))
                 status="approved"; usermsg=f"সাবমিশন #{item} অনুমোদিত। ৳{m(pay)} ব্যালেন্সে যোগ হয়েছে।"
             elif yes:
-                status="rejected"; usermsg=f"সাবমিশন #{item} বাতিল: কাজের বাজেট শেষ।"
+                status="rejected"; rejection_reason="কাজের বাজেট শেষ।"; usermsg=f"সাবমিশন #{item} বাতিল: {rejection_reason}"
             else:
-                status="rejected"; usermsg=f"সাবমিশন #{item} বাতিল হয়েছে।"
-            c.execute("UPDATE submissions SET status=?,reviewed=? WHERE id=? AND status='pending'",(status,now(),item)); target=r["worker_id"]
+                status="rejected"
+                rejection_reason=(rejection_reason or "কারণ উল্লেখ করা হয়নি।").strip()[:1000]
+                usermsg=f"❌ সাবমিশন #{item} বাতিল হয়েছে।\nরিজেক্টের কারণ: {rejection_reason}"
+            c.execute("UPDATE submissions SET status=?,reviewed=?,rejection_reason=? WHERE id=? AND status='pending'",(status,now(),rejection_reason if status=="rejected" else "",item)); target=r["worker_id"]
         else: await q.message.reply_text("অজানা রিভিউ।"); return
         c.execute("INSERT INTO audit(actor,action,details,created) VALUES(?,?,?,?)",(q.from_user.id,f"{kind}_{decision}",str(item),now()))
     await q.message.reply_text(f"{kind} #{item} সম্পন্ন।")
