@@ -254,6 +254,10 @@ async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         return
     if t in ("🔙 Back / ❌ Cancel","🔙 Back","❌ Cancel","/cancel"):
         await menu(update,ctx,"চলমান কাজ বাতিল হয়েছে।"); return
+    if u.id==ADMIN and ctx.user_data.get("admin_user_search"):
+        ctx.user_data.pop("admin_user_search",None)
+        await show_user_list(update.effective_message, search_term=t)
+        return
     if ctx.user_data.get("pending_submission_rejection"):
         sid = int(ctx.user_data.pop("pending_submission_rejection"))
         if len(t) < 3 or len(t) > 1000:
@@ -460,6 +464,49 @@ async def photo(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         ctx.user_data["proof_file_id"]=fid; ctx.user_data["stage"]="proof_both_text"
         await update.effective_message.reply_text("✅ Screenshot পেয়েছি। এখন প্রমাণের Text বা Link লিখুন।")
     else: await save_proof(update,ctx,ctx.user_data.get("proof_job"),"Screenshot proof",fid)
+async def show_user_list(message, page=0, search_term=None):
+    if search_term:
+        term = search_term.strip()
+        with conn() as c:
+            if term.isdigit():
+                rows = c.execute("SELECT id,username,first_name,banned FROM users WHERE id=? ORDER BY id DESC LIMIT 20", (int(term),)).fetchall()
+                total = len(rows)
+            else:
+                rows = c.execute("SELECT id,username,first_name,banned FROM users WHERE username ILIKE ? OR first_name ILIKE ? ORDER BY id DESC LIMIT 20", (f"%{term}%", f"%{term}%")).fetchall()
+                total = len(rows)
+        heading = f"🔎 Search: {term}\nম্যাচ: {total} জন"
+        keyboard = [[InlineKeyboardButton(f"{r['id']} | @{r['username'] or '—'} | {'⛔ BANNED' if r['banned'] else '🟢 ACTIVE'}", callback_data=f"userdetail:{r['id']}")] for r in rows]
+        keyboard.append([InlineKeyboardButton("🔙 User List", callback_data="adminusers:0")])
+    else:
+        page=max(0, int(page)); offset=page*20
+        with conn() as c:
+            total=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+            rows=c.execute("SELECT id,username,first_name,banned FROM users ORDER BY id DESC LIMIT 20 OFFSET ?",(offset,)).fetchall()
+        pages=max(1,(int(total)+19)//20)
+        heading=f"👥 User List\nমোট নিবন্ধিত ইউজার: {total} জন\nসর্বশেষ ২০ জন ইউজার\nপৃষ্ঠা: {page+1}/{pages}"
+        keyboard=[[InlineKeyboardButton(f"{r['id']} | @{r['username'] or '—'} | {'⛔ BANNED' if r['banned'] else '🟢 ACTIVE'}", callback_data=f"userdetail:{r['id']}")] for r in rows]
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("⬅️ Previous",callback_data=f"adminusers:{page-1}"))
+        if offset+20<int(total): nav.append(InlineKeyboardButton("Next ➡️",callback_data=f"adminusers:{page+1}"))
+        if nav: keyboard.append(nav)
+        keyboard.append([InlineKeyboardButton("🔍 Search User ID / Username",callback_data="adminusers:search"),InlineKeyboardButton("🔄 Refresh",callback_data=f"adminusers:{page}")])
+        keyboard.append([InlineKeyboardButton("🏠 Admin Panel",callback_data="adminrefresh")])
+    if not rows: heading += "\n\nকোনো User পাওয়া যায়নি।"
+    await message.reply_text(heading, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_user_detail(message, target_id):
+    with conn() as c:
+        r=c.execute("SELECT id,username,first_name,buyer,worker,banned,created,ban_reason FROM users WHERE id=?",(target_id,)).fetchone()
+    if not r:
+        await message.reply_text("ইউজার পাওয়া যায়নি।"); return
+    buyer=Decimal(r['buyer'] or 0); worker=Decimal(r['worker'] or 0); total=buyer+worker
+    status="⛔ BANNED" if r['banned'] else "🟢 ACTIVE"
+    text_msg=(f"👤 User Details\n\n🆔 User ID: {r['id']}\n👤 Username: @{r['username'] or '—'}\nনাম: {r['first_name'] or '—'}\n\n"
+              f"💼 Freelancer Balance: ৳{m(worker)}\n🛒 Buyer Balance: ৳{m(buyer)}\n💰 Total Balance: ৳{m(total)}\n\n"
+              f"Status: {status}\nনিবন্ধনের সময়: {r['created'] or '—'}\nBan Reason: {r['ban_reason'] or '—'}")
+    action=InlineKeyboardButton("✅ Unban",callback_data=f"userban:un:{r['id']}") if r['banned'] else InlineKeyboardButton("⛔ Ban",callback_data=f"userban:ban:{r['id']}")
+    await message.reply_text(text_msg,reply_markup=InlineKeyboardMarkup([[action],[InlineKeyboardButton("🔙 User List",callback_data="adminusers:0")]]))
+
 async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer(); d=q.data or ""; uid=q.from_user.id; user_row(q.from_user)
     if is_banned(uid) and d!="support": await banned_notice(q.message); return
@@ -482,19 +529,38 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     elif d == "adminlist:users":
         if uid != ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        await show_user_list(q.message, 0)
+    elif d.startswith("adminusers:"):
+        if uid != ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        arg=d.split(":",1)[1]
+        if arg=="search":
+            ctx.user_data["admin_user_search"]=True
+            await q.message.reply_text("User ID অথবা Username লিখুন। যেমন: 123456789 অথবা username")
+        else:
+            await show_user_list(q.message, int(arg))
+    elif d.startswith("userdetail:"):
+        if uid != ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        await show_user_detail(q.message, int(d.split(":",1)[1]))
+    elif d.startswith("userban:"):
+        if uid != ADMIN:
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
+        _, action, raw_id=d.split(":"); target_id=int(raw_id)
         with conn() as c:
-            rows=c.execute("""SELECT u.id,u.username,u.first_name,u.buyer,u.worker,u.banned,
-                COALESCE((SELECT SUM(CASE WHEN l.amount::numeric>0 AND l.kind IN ('earning','referral') THEN l.amount::numeric ELSE 0 END) FROM ledger l WHERE l.user_id=u.id),0) AS income,
-                COALESCE((SELECT SUM(w.gross::numeric) FROM withdrawals w WHERE w.user_id=u.id AND w.status='approved'),0) AS withdrawn
-                FROM users u ORDER BY u.id DESC LIMIT 20""").fetchall()
-        if not rows:
-            await q.message.reply_text("কোনো User নেই।"); return
-        for r in rows:
-            await q.message.reply_text(
-                f"👤 User ID: {r['id']}\nUsername: @{r['username'] or '—'}\nনাম: {r['first_name'] or '—'}\n"
-                f"Buyer Balance: ৳{m(r['buyer'] or 0)}\nFreelancer Balance: ৳{m(r['worker'] or 0)}\n"
-                f"মোট Income: ৳{m(r['income'])}\nমোট Approved Withdrawal: ৳{m(r['withdrawn'])}\n"
-                f"Status: {'BANNED' if r['banned'] else 'ACTIVE'}")
+            target=c.execute("SELECT id,username,banned FROM users WHERE id=?",(target_id,)).fetchone()
+            if not target:
+                await q.message.reply_text("ইউজার পাওয়া যায়নি।"); return
+            new_status=1 if action=="ban" else 0
+            c.execute("UPDATE users SET banned=?,ban_reason=? WHERE id=?",(new_status,"Admin action" if new_status else "",target_id))
+            c.execute("INSERT INTO audit(actor,action,details,created) VALUES(?,?,?,?)",(ADMIN,"user_ban" if new_status else "user_unban",str(target_id),now()))
+        try:
+            if new_status:
+                await ctx.bot.send_message(target_id,"⛔ আপনার অ্যাকাউন্ট বন্ধ করা হয়েছে। সহায়তার জন্য 🆘 সাহায্য বাটন ব্যবহার করুন।",reply_markup=support_only_kb())
+            else:
+                await ctx.bot.send_message(target_id,"✅ আপনার অ্যাকাউন্ট চালু করা হয়েছে। /start লিখে আবার শুরু করুন।")
+        except Exception: pass
+        await show_user_detail(q.message,target_id)
     elif d.startswith("adminlist:"):
         if uid!=ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
