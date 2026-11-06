@@ -1,5 +1,7 @@
-import os, logging, re
+import os, logging, re, threading
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extensions import TRANSACTION_STATUS_UNKNOWN
 from psycopg2.extras import RealDictCursor
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
@@ -97,36 +99,85 @@ class PGCursor:
         return iter(self.fetchall())
 
 
+# Reuse PostgreSQL connections instead of opening a new TLS connection
+# for every small database operation. This does not alter any table or data.
+_DB_POOL = None
+_DB_POOL_LOCK = threading.Lock()
+
+
+def _get_db_pool():
+    global _DB_POOL
+    if not DATABASE_URL:
+        raise RuntimeError("Hostless Secrets-এ DATABASE_URL সেট করুন (Neon PostgreSQL connection string)।")
+    if _DB_POOL is None:
+        with _DB_POOL_LOCK:
+            if _DB_POOL is None:
+                _DB_POOL = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=10,
+                    dsn=DATABASE_URL,
+                    sslmode="require",
+                    connect_timeout=20,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=3,
+                )
+    return _DB_POOL
+
+
 class PGConnection:
     def __init__(self):
-        if not DATABASE_URL:
-            raise RuntimeError("Hostless Secrets-এ DATABASE_URL সেট করুন (Neon PostgreSQL connection string)।")
-        self.raw = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=20)
-        self.raw.autocommit = False
+        self.pool = _get_db_pool()
+        self.raw = self.pool.getconn()
+        self._cursors = []
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        close_connection = False
         try:
             if exc_type:
                 self.raw.rollback()
             else:
                 self.raw.commit()
+        except Exception:
+            close_connection = True
+            try:
+                self.raw.close()
+            except Exception:
+                pass
+            raise
         finally:
-            self.raw.close()
+            for cur in self._cursors:
+                try:
+                    cur.close()
+                except Exception:
+                    close_connection = True
+            try:
+                if self.raw.closed or self.raw.get_transaction_status() == TRANSACTION_STATUS_UNKNOWN:
+                    close_connection = True
+                self.pool.putconn(self.raw, close=close_connection)
+            except Exception:
+                try:
+                    self.raw.close()
+                except Exception:
+                    pass
         return False
 
     def execute(self, query, params=None):
-        return PGCursor(self.raw.cursor(cursor_factory=RealDictCursor)).execute(query, params)
+        cur = self.raw.cursor(cursor_factory=RealDictCursor)
+        self._cursors.append(cur)
+        return PGCursor(cur).execute(query, params)
 
     def executescript(self, script):
         cur = self.raw.cursor()
+        self._cursors.append(cur)
         for statement in script.split(";"):
             statement = statement.strip()
             if statement:
                 cur.execute(statement)
-        cur.close()
 
     def commit(self):
         self.raw.commit()
@@ -463,8 +514,7 @@ async def show_buyer_job_submissions(message, buyer_id, job_id):
             details += f"\nReject reason: {row['rejection_reason']}"
         if row.get("file_id"):
             try:
-                await message.reply_photo(row["file_id"],caption=details[:1024])
-                if len(details)>1024:
+                await message.reply_photo(row["file_id"],caption=details[:1024])                 if len(details)>1024:
                     await message.reply_text(details[1024:])
             except Exception:
                 log.exception("buyer submission photo display failed")
