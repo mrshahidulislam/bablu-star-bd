@@ -464,7 +464,7 @@ async def show_buyer_job_submissions(message, buyer_id, job_id):
             return
         rows=c.execute("SELECT s.*,u.username,u.first_name FROM submissions s LEFT JOIN users u ON u.id=s.worker_id WHERE s.job_id=? ORDER BY s.id DESC LIMIT 50",(job_id,)).fetchall()
     if not rows:
-        await message.reply_text(f"কাজ #{job_id} — {job['title']}\nএখনো কোনো সাবমিশন জমা পড়েনি।")
+                await message.reply_text(f"কাজ #{job_id} — {job['title']}\nএখনো কোনো সাবমিশন জমা পড়েনি।")
         return
     await message.reply_text(f"📨 কাজ #{job_id} — {job['title']}\nমোট {len(rows)}টি সাম্প্রতিক সাবমিশন:")
     for row in rows:
