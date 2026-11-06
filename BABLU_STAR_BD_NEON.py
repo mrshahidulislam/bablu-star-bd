@@ -514,7 +514,8 @@ async def show_buyer_job_submissions(message, buyer_id, job_id):
             details += f"\nReject reason: {row['rejection_reason']}"
         if row.get("file_id"):
             try:
-                await message.reply_photo(row["file_id"],caption=details[:1024])                 if len(details)>1024:
+                await message.reply_photo(row["file_id"],caption=details[:1024])
+                if len(details)>1024:
                     await message.reply_text(details[1024:])
             except Exception:
                 log.exception("buyer submission photo display failed")
@@ -614,8 +615,7 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("ড্যাশবোর্ড আপডেট করতে /admin লিখুন।")
     elif d == "admintext:list":
         if uid != ADMIN:
-            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
-        await show_editable_texts(q.message)
+            await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); await show_editable_texts(q.message)
     elif d.startswith("admintext:edit:"):
         if uid != ADMIN:
             await q.message.reply_text("শুধু অ্যাডমিন এই কাজটি করতে পারবেন।"); return
