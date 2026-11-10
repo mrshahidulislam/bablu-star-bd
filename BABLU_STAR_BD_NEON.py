@@ -1,6 +1,7 @@
-import os, logging, re
+import os, logging, re, time, threading
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import OperationalError, InterfaceError
+from psycopg2.pool import ThreadedConnectionPool, PoolError
 from psycopg2.extras import RealDictCursor
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ REFERRAL = Decimal("0.10")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bablu-star-bd")
 DB_POOL = None
+DB_POOL_LOCK = threading.Lock()
 
 CATS = [
     ("📘 Facebook", 2), ("▶️ YouTube", 2), ("📸 Instagram", 2), ("🎵 TikTok", 2),
@@ -37,8 +39,22 @@ def amount(s):
     except (InvalidOperation,ValueError): return None
 
 class PGCursor:
-    def __init__(self, cursor):
+    def __init__(self, cursor, connection=None):
         self._cursor = cursor
+        self._connection = connection
+
+    def _run(self, query, params=None):
+        """Run SQL; recover once from a stale Neon connection before a transaction starts."""
+        try:
+            self._cursor.execute(query, params or ())
+        except (OperationalError, InterfaceError):
+            if self._connection is None or self._connection._executed:
+                raise
+            self._connection.reconnect()
+            self._cursor = self._connection.raw.cursor(cursor_factory=RealDictCursor)
+            self._cursor.execute(query, params or ())
+        if self._connection is not None:
+            self._connection._executed += 1
         self.lastrowid = None
         self.rowcount = -1
 
@@ -49,7 +65,7 @@ class PGCursor:
         # SQLite schema introspection -> PostgreSQL information_schema.
         if q.upper().startswith("PRAGMA TABLE_INFO("):
             table = q[q.find("(")+1:q.rfind(")")].strip().strip("'\"")
-            self._cursor.execute(
+            self._run(
                 "SELECT column_name AS name FROM information_schema.columns "
                 "WHERE table_schema=current_schema() AND table_name=%s ORDER BY ordinal_position",
                 (table,)
@@ -73,14 +89,14 @@ class PGCursor:
             table = table_match.group(1).lower() if table_match else ""
             if table in {"jobs", "submissions", "deposits", "withdrawals", "ledger", "audit"}:
                 q = q.rstrip().rstrip(";") + " RETURNING id"
-                self._cursor.execute(q, params or ())
+                self._run(q, params)
                 row = self._cursor.fetchone()
                 if row:
                     self.lastrowid = row["id"]
                 self.rowcount = 1
                 return self
 
-        self._cursor.execute(q, params or ())
+        self._run(q, params)
         self.rowcount = self._cursor.rowcount
         return self
 
@@ -104,11 +120,46 @@ class PGConnection:
         global DB_POOL
         if not DATABASE_URL:
             raise RuntimeError("Hostless Secrets-এ DATABASE_URL সেট করুন (Neon PostgreSQL connection string)।")
-        # Reuse warm PostgreSQL connections instead of opening a new TLS connection
-        # for every small bot operation (a major source of multi-second latency).
-        if DB_POOL is None:
-            DB_POOL = ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode="require", connect_timeout=8, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
-        self.raw = DB_POOL.getconn()
+        self.raw = self._get_connection()
+        self.raw.autocommit = False
+        self._executed = 0
+
+    @staticmethod
+    def _get_connection():
+        global DB_POOL
+        last_error = None
+        for attempt in range(3):
+            try:
+                with DB_POOL_LOCK:
+                    if DB_POOL is None:
+                        DB_POOL = ThreadedConnectionPool(
+                            1, 10, DATABASE_URL, sslmode="require", connect_timeout=15,
+                            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3
+                        )
+                    raw = DB_POOL.getconn()
+                if raw.closed:
+                    with DB_POOL_LOCK:
+                        DB_POOL.putconn(raw, close=True)
+                    raise OperationalError("Neon returned a closed pooled connection")
+                return raw
+            except (OperationalError, InterfaceError, PoolError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.4 * (2 ** attempt))
+        raise last_error
+
+    def reconnect(self):
+        """Replace a stale pooled connection; only called before any SQL succeeded."""
+        global DB_POOL
+        old = self.raw
+        try:
+            with DB_POOL_LOCK:
+                if DB_POOL is not None:
+                    DB_POOL.putconn(old, close=True)
+        except Exception:
+            try: old.close()
+            except Exception: pass
+        self.raw = self._get_connection()
         self.raw.autocommit = False
 
     def __enter__(self):
@@ -121,15 +172,16 @@ class PGConnection:
             else:
                 self.raw.commit()
         finally:
-            # Return the connection to the pool; do not tear down TCP/TLS each time.
             if self.raw.closed:
-                DB_POOL.putconn(self.raw, close=True)
+                with DB_POOL_LOCK:
+                    DB_POOL.putconn(self.raw, close=True)
             else:
-                DB_POOL.putconn(self.raw)
+                with DB_POOL_LOCK:
+                    DB_POOL.putconn(self.raw)
         return False
 
     def execute(self, query, params=None):
-        return PGCursor(self.raw.cursor(cursor_factory=RealDictCursor)).execute(query, params)
+        return PGCursor(self.raw.cursor(cursor_factory=RealDictCursor), self).execute(query, params)
 
     def executescript(self, script):
         cur = self.raw.cursor()
@@ -215,11 +267,14 @@ def init():
         c.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user_kind ON ledger(user_id, kind)")
 
 def user_row(u):
+    # One atomic round-trip instead of SELECT followed by INSERT/UPDATE.
     with conn() as c:
-        r=c.execute("SELECT * FROM users WHERE id=?",(u.id,)).fetchone()
-        if not r:
-            c.execute("INSERT INTO users(id,username,first_name,created) VALUES(?,?,?,?)",(u.id,u.username or "",u.first_name or "",now()))
-        else: c.execute("UPDATE users SET username=?,first_name=? WHERE id=?",(u.username or "",u.first_name or "",u.id))
+        return c.execute(
+            "INSERT INTO users(id,username,first_name,created) VALUES(?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name "
+            "RETURNING banned, (SELECT value FROM settings WHERE key='welcome_text') AS welcome_text",
+            (u.id, u.username or "", u.first_name or "", now())
+        ).fetchone()
 def kb(mode):
     return ReplyKeyboardMarkup(BUYER if mode=="buyer" else WORKER if mode=="worker" else MAIN,resize_keyboard=True)
 def is_banned(uid):
@@ -230,8 +285,8 @@ def support_only_kb():
     return ReplyKeyboardMarkup([["🆘 সাহায্য"]],resize_keyboard=True)
 async def banned_notice(target):
     await target.reply_text("⛔ আপনার অ্যাকাউন্ট সাময়িকভাবে বন্ধ আছে। আপিল বা সহায়তার জন্য নিচের 🆘 সাহায্য বাটন ব্যবহার করুন।",reply_markup=support_only_kb())
-async def menu(update,ctx,msg="মেনু থেকে অপশন বেছে নিন."):
-    if update.effective_user and is_banned(update.effective_user.id):
+async def menu(update,ctx,msg="মেনু থেকে অপশন বেছে নিন.",check_ban=True):
+    if check_ban and update.effective_user and is_banned(update.effective_user.id):
         target=update.effective_message or update.callback_query.message
         await banned_notice(target); return
     for k in ("stage","form","proof_job","pending_submission_rejection","admin_setting_key","proof_file_id"): ctx.user_data.pop(k,None)
@@ -243,19 +298,31 @@ async def admin_msg(ctx,text,kind=None,item=None):
     try: await ctx.bot.send_message(ADMIN,text,reply_markup=markup)
     except Exception: log.exception("admin notification failed")
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user; user_row(u)
-    if is_banned(u.id): await banned_notice(update.effective_message); return
-    if ctx.args and ctx.args[0].startswith("ref_"):
-        try:
-            ref=int(ctx.args[0][4:])
-            if ref!=u.id:
-                with conn() as c:
-                    r=c.execute("SELECT referrer FROM users WHERE id=?",(u.id,)).fetchone()
-                    if r and r["referrer"] is None and c.execute("SELECT 1 FROM users WHERE id=?",(ref,)).fetchone():
-                        c.execute("UPDATE users SET referrer=? WHERE id=?",(ref,u.id))
-        except ValueError: pass
-    ctx.user_data["mode"]="main"
-    await menu(update, ctx, get_setting("welcome_text", "🌟 BABLU STAR BD-তে আপনাকে স্বাগতম! 🌟\n\n💼 আপনার কাজ, আপনার উপার্জন!\n🛒 Buyer Mode — নিজের কাজ পোস্ট করুন\n🧑‍💻 Freelancer Mode — কাজ করুন ও আয় করুন\n👇 শুরু করতে নিচের একটি মোড বেছে নিন."))
+    u = update.effective_user
+    try:
+        row = user_row(u)
+        if row and row.get("banned"):
+            await banned_notice(update.effective_message)
+            return
+        if ctx.args and ctx.args[0].startswith("ref_"):
+            try:
+                ref = int(ctx.args[0][4:])
+                if ref != u.id:
+                    with conn() as c:
+                        c.execute(
+                            "UPDATE users SET referrer=? WHERE id=? AND referrer IS NULL "
+                            "AND EXISTS (SELECT 1 FROM users WHERE id=?)",
+                            (ref, u.id, ref)
+                        )
+            except ValueError:
+                log.warning("Invalid referral argument from user %s", u.id)
+        ctx.user_data["mode"] = "main"
+        welcome = (row.get("welcome_text") if row else None) or "🌟 BABLU STAR BD-তে আপনাকে স্বাগতম! 🌟\n\n💼 আপনার কাজ, আপনার উপার্জন!\n🛒 Buyer Mode — নিজের কাজ পোস্ট করুন\n🧑‍💻 Freelancer Mode — কাজ করুন ও আয় করুন\n👇 শুরু করতে নিচের একটি মোড বেছে নিন।"
+        await menu(update, ctx, welcome, check_ban=False)
+    except Exception:
+        log.exception("/start failed for Telegram user_id=%s", u.id if u else "unknown")
+        await update.effective_message.reply_text("সাময়িক সংযোগ সমস্যা হয়েছে। ২–৩ সেকেন্ড পর আবার /start দিন।")
+
 async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     u=update.effective_user; user_row(u); t=(update.effective_message.text or "").strip()
     with conn() as c:
@@ -773,7 +840,7 @@ async def cancel_cmd(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): await banned_notice(update.effective_message); return
     await menu(update,ctx,"চলমান কাজ বাতিল হয়েছে।")
 async def err(update,ctx):
-    log.exception("Bot error",exc_info=ctx.error)
+    log.error("Unhandled Telegram update error", exc_info=(type(ctx.error), ctx.error, ctx.error.__traceback__) if ctx.error else None)
     if update and update.effective_message:
         try: await update.effective_message.reply_text("সমস্যা হয়েছে। আবার চেষ্টা করুন।")
         except: pass
@@ -782,6 +849,7 @@ async def close_db_pool(app):
     if DB_POOL is not None:
         DB_POOL.closeall()
         DB_POOL = None
+DB_POOL_LOCK = threading.Lock()
 
 def main():
     if not TOKEN: raise SystemExit("Hostless Secrets-এ BOT_TOKEN সেট করুন।")
